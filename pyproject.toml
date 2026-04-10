@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pinn-solver-private"
+version = "0.1.0"
+description = "Private source repository for a PINN/FNO-based PDE solver and Streamlit app."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+  "streamlit>=1.32",
+  "sympy>=1.12",
+  "torch>=2.2",
+]
+
+[project.optional-dependencies]
+build = [
+  "pyinstaller>=6.6",
+]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = [
+  "app",
+  "evaluate",
+  "inference_engine",
+  "launcher",
+  "ood_detector",
+  "pde_parser",
+  "pde_space",
+  "trainer",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["models*", "physics*"]
+
+[tool.pytest.ini_options]
+pythonpath = [
+  "src",
+]
+testpaths = [
+  "unit_test",
+]
