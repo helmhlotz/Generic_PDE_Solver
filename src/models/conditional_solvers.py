@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -80,8 +81,11 @@ class ConditionalFNO2D(NeuralPDEModel):
         ).to(self.device)
 
         if pretrained_path is not None:
-            load_model_weights(self.model, pretrained_path, self.device)
-            print(f"Loaded pretrained FNO model from {pretrained_path}")
+            if Path(pretrained_path).exists():
+                load_model_weights(self.model, pretrained_path, self.device)
+                print(f"Loaded pretrained FNO model from {pretrained_path}")
+            else:
+                print(f"Pretrained FNO path {pretrained_path!r} not found; training from scratch.")
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 

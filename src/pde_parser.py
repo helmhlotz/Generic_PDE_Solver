@@ -2,7 +2,7 @@
 
 Supported PDE language (sympy-compatible strings)
 --------------------------------------------------
-Symbols:  x, y, t, u, u_x, u_y, u_xx, u_yy, u_xy, u_t
+Symbols:  x, y, u, u_x, u_y, u_xx, u_yy, u_xy
           plus standard math:  pi, sin, cos, exp, sqrt, abs
 
 Example PDE strings (steady-state)
@@ -10,12 +10,7 @@ Example PDE strings (steady-state)
     "u_xx + u_yy = sin(pi*x)*cos(pi*y)"     Poisson with sinusoidal source
     "u_xx + u_yy + 4*u = 0"                 Helmholtz k²=4
 
-Example PDE strings (time-dependent)
-    "u_t + u_xx + u_yy = 0"                 Heat/diffusion equation
-    "u_t - u_xx = sin(pi*x)*exp(-t)"        Heat with source
-    "u_tt - u_xx = 0"                        Wave equation (if u_tt supported)
-
-Boundary condition dict (all four walls must be specified)
+Boundary condition dict (unspecified walls default to homogeneous Dirichlet)
     {
         "left":   {"type": "dirichlet", "value": "0"},
         "right":  {"type": "dirichlet", "value": "0"},
@@ -237,9 +232,9 @@ def parse_pde(pde_str: str) -> ParsedPDE:
         String of the form  ``"<LHS> = <RHS>"`` where LHS contains derivative
         symbols and RHS is a function of x, y, and optionally t.
         
-        Supports time-dependent PDEs:
-            "u_t + u_xx + u_yy = sin(pi*x)"   (heat/diffusion)
-            "u_xx + u_yy = 0"                   (steady-state Laplace)
+        Intended for steady-state PDEs such as:
+            "u_xx + u_yy = sin(pi*x)"
+            "u_xx + u_yy = 0"
 
     Returns
     -------
@@ -276,8 +271,13 @@ def parse_pde(pde_str: str) -> ParsedPDE:
     )
     residual_lhs = sp.simplify(lhs_expr - reconstructed_lhs)
     if residual_lhs != 0:
-        # Accept it but warn — extra terms moved to negative RHS
-        rhs_expr = rhs_expr + residual_lhs
+        raise ValueError(
+            f"Unsupported PDE: the left-hand side contains terms with variable "
+            f"(x/y/t-dependent) coefficients that cannot be extracted as constants. "
+            f"Unrecognised LHS remainder: {residual_lhs}. "
+            f"Move all variable-coefficient terms to the right-hand side, e.g. write "
+            f"'u_xx + u_yy = -x*u_xx' instead of '(1+x)*u_xx + u_yy = 0'."
+        )
 
     # Poisson-like: second-order steady (g=0), no mixed or first-order terms, constant coeffs
     poisson_like = (

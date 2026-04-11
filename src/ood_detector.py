@@ -80,7 +80,11 @@ class PDEFeaturizer:
         xs, ys = np.meshgrid(s, s, indexing="ij")
         try:
             rhs_fn = parsed_pde.rhs_fn()
-            rhs_vals = np.asarray(rhs_fn(xs, ys), dtype=np.float32)
+            # rhs_fn wrapper calls .detach().cpu().numpy() on its inputs, so
+            # numpy arrays must be converted to torch tensors before the call.
+            xs_t = torch.tensor(xs, dtype=torch.float32)
+            ys_t = torch.tensor(ys, dtype=torch.float32)
+            rhs_vals = np.asarray(rhs_fn(xs_t, ys_t).numpy(), dtype=np.float32)
             feat[idx]     = float(np.sqrt(np.mean(rhs_vals ** 2)))   # RMS ≈ L2/N
             feat[idx + 1] = float(np.max(np.abs(rhs_vals)))
         except Exception:
@@ -220,6 +224,7 @@ class OODDetector:
         features: np.ndarray,
         manifest_path: str | Path,
         ood_percentile: float = 95.0,
+        calibration_features: np.ndarray | None = None,
     ) -> None:
         """Compute normalisation stats and KNN threshold; save as ``.npz``.
 
@@ -239,15 +244,24 @@ class OODDetector:
 
         features_norm = (features - feat_min) / feat_range
 
-        # Leave-one-out nearest-neighbour distances (O(N²D) but fast in numpy)
-        nn_dists = np.zeros(n, dtype=np.float32)
-        for i in range(n):
-            diffs = features_norm - features_norm[i : i + 1]  # (N, D)
-            dists = np.sqrt((diffs ** 2).sum(axis=1))          # (N,)
-            dists[i] = np.inf                                   # exclude self
-            nn_dists[i] = float(dists.min())
+        if calibration_features is not None:
+            calibration_features = np.asarray(calibration_features, dtype=np.float32)
+            calib_norm = (calibration_features - feat_min) / feat_range
+            diffs = calib_norm[:, None, :] - features_norm[None, :, :]
+            dists = np.sqrt((diffs ** 2).sum(axis=2))
+            threshold_source = dists.min(axis=1)
+            calibration_label = f"holdout={len(calibration_features)}"
+        else:
+            # Fall back to training leave-one-out distances when no holdout set is provided.
+            threshold_source = np.zeros(n, dtype=np.float32)
+            for i in range(n):
+                diffs = features_norm - features_norm[i : i + 1]
+                dists = np.sqrt((diffs ** 2).sum(axis=1))
+                dists[i] = np.inf
+                threshold_source[i] = float(dists.min())
+            calibration_label = "train_loo"
 
-        threshold = float(np.percentile(nn_dists, ood_percentile))
+        threshold = float(np.percentile(threshold_source, ood_percentile))
 
         Path(manifest_path).parent.mkdir(parents=True, exist_ok=True)
         np.savez(
@@ -259,7 +273,8 @@ class OODDetector:
         )
         print(
             f"OOD manifest saved to {manifest_path} "
-            f"({n} samples, threshold={threshold:.4f} @ {ood_percentile}th pct)"
+            f"({n} train samples, threshold={threshold:.4f} @ {ood_percentile}th pct, "
+            f"calibration={calibration_label})"
         )
 
     # ------------------------------------------------------------------
@@ -274,5 +289,4 @@ class OODDetector:
             return True
         except Exception:
             return False
-
 

@@ -10,7 +10,19 @@ from pde_parser import ParsedBC
 
 
 class ConditionalGrid2D:
-    """Build the 7-channel input tensor for the conditional FNO."""
+    """Build the shared 7-channel input tensor for the conditional solvers.
+
+    Channel layout:
+        0: x coordinate
+        1: y coordinate
+        2: source term
+        3: boundary-condition RHS/value field on the boundary
+        4: repeated RHS field for derivative-involving BCs (beta != 0)
+        5: alpha coefficient
+        6: beta coefficient
+
+    Channel 4 is intentionally not a numerically estimated normal-flux field.
+    """
 
     def __init__(
         self,

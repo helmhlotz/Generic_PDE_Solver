@@ -63,8 +63,8 @@ from models.conditional_solvers import _PointwiseConditionalPINNNet
 from models.fno_model import FNO2DModel
 from pde_space import PDESpaceConfig, LHSSampler
 from ood_detector import PDEFeaturizer, OODDetector
-from pde_parser import build_fd_residual, parse_bc, parse_pde
-from physics.pde_helpers import GeneralPDE
+from pde_parser import parse_bc, parse_pde
+from physics.pde_helpers import GeneralPDE, compute_sample_metrics, solve_fd_jacobi
 
 
 # ---------------------------------------------------------------------------
@@ -86,35 +86,19 @@ def _solve_fd_standalone(
     tolerance: float,
 ) -> torch.Tensor | None:
     """Standalone FD solver (not a method) so it can run in worker processes."""
-    x_1d = torch.linspace(0, 1, n_points, device=device)
-    y_1d = torch.linspace(0, 1, n_points, device=device)
-    u = torch.zeros((n_points, n_points), device=device, dtype=torch.float32)
-    u = pde_obj.apply_boundary_conditions(u, x_1d, y_1d)
-    residual_fn = build_fd_residual(pde_obj.parsed_pde)
-
-    parsed = pde_obj.parsed_pde
-    h = 1.0 / (n_points - 1)
-    diag = torch.zeros((n_points - 2, n_points - 2), device=device, dtype=torch.float32)
-    if parsed.a != 0.0:
-        diag = diag + parsed.a * (-2.0 / h**2)
-    if parsed.b != 0.0:
-        diag = diag + parsed.b * (-2.0 / h**2)
-    if parsed.f != 0.0:
-        diag = diag + parsed.f
-    if (diag.abs() < 1e-14).any():
+    try:
+        u, _, _, _ = solve_fd_jacobi(
+            pde_obj=pde_obj,
+            n_points=n_points,
+            device=device,
+            max_iterations=max_iterations,
+            tolerance=tolerance,
+            print_every=None,
+            sanitize_on_divergence=False,
+        )
+        return u
+    except ValueError:
         return None
-
-    for _ in range(max_iterations):
-        u_old = u.clone()
-        residual = residual_fn(u)
-        u[1:-1, 1:-1] = u[1:-1, 1:-1] - residual / diag
-        u = pde_obj.apply_boundary_conditions(u, x_1d, y_1d)
-        if torch.isnan(u).any() or torch.isinf(u).any():
-            return None
-        if torch.max(torch.abs(u - u_old)).item() < tolerance:
-            break
-
-    return u.detach()
 
 
 def _solve_one(args: tuple) -> dict | None:
@@ -123,12 +107,12 @@ def _solve_one(args: tuple) -> dict | None:
     Always uses CPU so CUDA contexts are never shared across processes.
     All arguments must be plain picklable types (no torch.device, no lambdas).
     """
-    prob, n_points, max_iters, tol = args
+    prob, n_points, device_str, max_iters, tol = args
     try:
         parsed_pde = parse_pde(prob["pde_str"])
         bc_specs = parse_bc(prob["bc_dict"])
         source_fn = parsed_pde.rhs_fn()
-        device = torch.device("cpu")
+        device = torch.device(device_str)
         grid = ConditionalGrid2D(n_points, bc_specs, source_fn, device)
         pde_obj = GeneralPDE(parsed_pde, bc_specs)
         u_fd = _solve_fd_standalone(pde_obj, n_points, device, max_iters, tol)
@@ -171,38 +155,8 @@ class SharedFDDataGenerator:
         max_iterations: int,
         tolerance: float,
     ) -> torch.Tensor | None:
-        """Solve one PDE with Jacobi FD; return u (n,n) or None if failed."""
-        n_points = self.n_points
-        x_1d = torch.linspace(0, 1, n_points, device=self.device)
-        y_1d = torch.linspace(0, 1, n_points, device=self.device)
-        u = torch.zeros((n_points, n_points), device=self.device, dtype=torch.float32)
-        u = pde_obj.apply_boundary_conditions(u, x_1d, y_1d)
-        residual_fn = build_fd_residual(pde_obj.parsed_pde)
-
-        parsed = pde_obj.parsed_pde
-        h = 1.0 / (n_points - 1)
-        diag = torch.zeros((n_points - 2, n_points - 2), device=self.device, dtype=torch.float32)
-        if parsed.a != 0.0:
-            diag = diag + parsed.a * (-2.0 / h**2)
-        if parsed.b != 0.0:
-            diag = diag + parsed.b * (-2.0 / h**2)
-        if parsed.f != 0.0:
-            diag = diag + parsed.f
-        if (diag.abs() < 1e-14).any():
-            return None
-
-        for _ in range(max_iterations):
-            u_old = u.clone()
-            residual = residual_fn(u)
-            u[1:-1, 1:-1] = u[1:-1, 1:-1] - residual / diag
-            u = pde_obj.apply_boundary_conditions(u, x_1d, y_1d)
-
-            if torch.isnan(u).any() or torch.isinf(u).any():
-                return None
-            if torch.max(torch.abs(u - u_old)).item() < tolerance:
-                break
-
-        return u.detach()
+        """Solve one PDE with Jacobi FD; delegates to shared _solve_fd_standalone."""
+        return _solve_fd_standalone(pde_obj, self.n_points, self.device, max_iterations, tolerance)
 
     def generate(
         self,
@@ -216,6 +170,7 @@ class SharedFDDataGenerator:
         print_every: int = 200,
         n_workers: int | None = None,
         chunk_size: int = _CHUNK_SIZE,
+        ood_percentile: float = 95.0,
     ) -> int:
         """Generate and save dataset with fields input_grid and fd_target.
 
@@ -256,7 +211,7 @@ class SharedFDDataGenerator:
 
             chunk_problems = problems[chunk_start:chunk_end]
             args_list = [
-                (p, self.n_points, max_iterations, tolerance)
+                (p, self.n_points, str(self.device), max_iterations, tolerance)
                 for p in chunk_problems
             ]
 
@@ -304,15 +259,41 @@ class SharedFDDataGenerator:
             targets=np.stack(targets),
             pde_strs=np.array(pde_strs, dtype=object),
             bc_dict_json=np.array(bc_json, dtype=object),
+            feats=np.stack(feats),
             n_points=np.array([self.n_points], dtype=np.int32),
         )
         print(f"Saved dataset: {save_path} ({len(inputs)} samples)")
 
-        if manifest_path is not None and feats:
-            OODDetector.build_manifest(np.stack(feats), manifest_path=manifest_path)
-            print(f"Saved OOD manifest: {manifest_path}")
-
         return len(inputs)
+
+
+def _load_dataset_features(dataset_path: str) -> np.ndarray:
+    """Load PDE feature vectors stored in a generated dataset."""
+    data = np.load(dataset_path, allow_pickle=True)
+    if "feats" not in data:
+        raise KeyError(
+            f"Dataset {dataset_path!r} does not contain stored PDE features. "
+            "Re-generate it with the current trainer before building an OOD manifest."
+        )
+    return np.asarray(data["feats"], dtype=np.float32)
+
+
+def _build_manifest_from_datasets(
+    train_dataset_path: str,
+    manifest_path: str,
+    ood_percentile: float,
+    val_dataset_path: str | None = None,
+) -> None:
+    """Build an OOD manifest using train features and optional held-out validation features."""
+    train_feats = _load_dataset_features(train_dataset_path)
+    val_feats = _load_dataset_features(val_dataset_path) if val_dataset_path is not None else None
+    OODDetector.build_manifest(
+        train_feats,
+        manifest_path=manifest_path,
+        ood_percentile=ood_percentile,
+        calibration_features=val_feats,
+    )
+    print(f"Saved OOD manifest: {manifest_path}")
 
 
 # Backward-compatible alias
@@ -514,11 +495,9 @@ class HybridFNOTrainer:
                 u_pred = self.model(ex["input"].unsqueeze(0)).squeeze(0).squeeze(-1)
                 u_fd   = ex["target"]
 
-                diff    = u_pred - u_fd
-                fd_norm = torch.norm(u_fd) + 1e-12
-                rel_l2  = float(torch.norm(diff) / fd_norm)
-                max_err = float(torch.max(torch.abs(diff)))
-                rmse    = float(torch.sqrt(torch.mean(diff ** 2)))
+                rel_l2, rmse, max_err = compute_sample_metrics(
+                    u_pred.cpu().numpy(), u_fd.cpu().numpy()
+                )
                 bc_err  = float(ex["pde_obj"].compute_bc_loss(u_pred, ex["x_1d"], ex["y_1d"]))
                 pde_res = float(ex["pde_obj"].compute_pde_loss(u_pred))
 
@@ -697,10 +676,11 @@ class PINNTrainer:
                 print(f"Loading PINN validation problems from dataset: {val_dataset_path}")
                 val_problems = self._load_problems_from_dataset(val_dataset_path)
             else:
-                # Auto 80/20 split: last 20% as validation (deterministic, no rng needed)
-                n_val_auto = max(1, len(train_problems) // 5)
-                val_problems = train_problems[-n_val_auto:]
-                train_problems = train_problems[:-n_val_auto]
+                # Auto 80/20 split: shuffle first to avoid LHS-order bias
+                shuffled = [train_problems[i] for i in rng.permutation(len(train_problems))]
+                n_val_auto = max(1, len(shuffled) // 5)
+                val_problems = shuffled[-n_val_auto:]
+                train_problems = shuffled[:-n_val_auto]
                 print(
                     f"Auto 80/20 split: {len(train_problems)} train / "
                     f"{len(val_problems)} val problems"
@@ -852,11 +832,9 @@ class PINNTrainer:
                 u_pred = self.net(ex["input"].unsqueeze(0)).squeeze(0).squeeze(-1)
                 u_fd   = ex["target"]
 
-                diff    = u_pred - u_fd
-                fd_norm = torch.norm(u_fd) + 1e-12
-                rel_l2  = float(torch.norm(diff) / fd_norm)
-                max_err = float(torch.max(torch.abs(diff)))
-                rmse    = float(torch.sqrt(torch.mean(diff ** 2)))
+                rel_l2, rmse, max_err = compute_sample_metrics(
+                    u_pred.cpu().numpy(), u_fd.cpu().numpy()
+                )
                 bc_err  = float(ex["pde_obj"].compute_bc_loss(u_pred, ex["x_1d"], ex["y_1d"]))
                 pde_res = float(ex["pde_obj"].compute_pde_loss(u_pred))
 
@@ -945,6 +923,8 @@ def _make_parser() -> argparse.ArgumentParser:
     fno_gen_sub.add_argument("--print-every",    type=int,   default=200)
     fno_gen_sub.add_argument("--n-workers",       type=int,   default=None,
                          help="Worker processes for parallel FD generation (default: cpu_count)")
+    fno_gen_sub.add_argument("--ood-percentile",  type=float, default=95.0,
+                         help="KNN threshold percentile for OOD detection (default: 95.0)")
     fno_gen_sub.add_argument("--device",         type=str,   default=None)
 
     # --- fno train sub-command ---
@@ -994,6 +974,8 @@ def _make_parser() -> argparse.ArgumentParser:
                        help="Evaluate val set every N epochs (default: 1)")
     fno_sub.add_argument("--n-workers",     type=int,   default=None,
                        help="Worker processes for parallel FD generation (default: cpu_count)")
+    fno_sub.add_argument("--ood-percentile", type=float, default=95.0,
+                       help="KNN threshold percentile for OOD detection (default: 95.0)")
 
     # --- pinn sub-command ---
     pinn_sub = sub.add_parser("pinn", help="Train the shared PINN solution operator")
@@ -1069,22 +1051,32 @@ def main() -> None:
             n_samples=args.samples,
             seed=args.seed,
             save_path=args.dataset_path,
-            manifest_path=args.manifest_path,
+            manifest_path=None,
             max_iterations=args.max_iterations,
             tolerance=args.tolerance,
             print_every=args.print_every,
             n_workers=args.n_workers,
+            ood_percentile=args.ood_percentile,
         )
+        val_dataset_path: str | None = None
         if args.n_val > 0:
+            val_dataset_path = args.val_dataset_path
             generator.generate(
                 n_samples=args.n_val,
                 seed=args.seed + 99999,
-                save_path=args.val_dataset_path,
+                save_path=val_dataset_path,
                 manifest_path=None,
                 max_iterations=args.max_iterations,
                 tolerance=args.tolerance,
                 print_every=max(20, args.print_every // 4),
                 n_workers=args.n_workers,
+            )
+        if args.manifest_path:
+            _build_manifest_from_datasets(
+                train_dataset_path=args.dataset_path,
+                val_dataset_path=val_dataset_path,
+                manifest_path=args.manifest_path,
+                ood_percentile=args.ood_percentile,
             )
 
     elif args.command == "fno-train":
@@ -1118,11 +1110,12 @@ def main() -> None:
             n_samples=args.samples,
             seed=args.seed,
             save_path=args.dataset_path,
-            manifest_path=args.manifest_path,
+            manifest_path=None,
             max_iterations=args.max_iterations,
             tolerance=args.tolerance,
             print_every=args.print_every,
             n_workers=args.n_workers,
+            ood_percentile=args.ood_percentile,
         )
         val_dataset_path = None
         if args.n_val > 0:
@@ -1136,6 +1129,13 @@ def main() -> None:
                 tolerance=args.tolerance,
                 print_every=max(20, args.print_every // 4),
                 n_workers=args.n_workers,
+            )
+        if args.manifest_path:
+            _build_manifest_from_datasets(
+                train_dataset_path=args.dataset_path,
+                val_dataset_path=val_dataset_path,
+                manifest_path=args.manifest_path,
+                ood_percentile=args.ood_percentile,
             )
 
         trainer = HybridFNOTrainer(

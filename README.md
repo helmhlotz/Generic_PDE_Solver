@@ -178,13 +178,15 @@ channel 0 : x coordinate
 channel 1 : y coordinate
 channel 2 : source term f(x,y)
 channel 3 : BC value field
-channel 4 : BC flux field
+channel 4 : BC RHS field for derivative-involving BCs
 channel 5 : BC alpha (Robin)
 channel 6 : BC beta  (Robin)
 shape: (1, n, n, 7)  — batch-first, channel-last
 ```
 
 This unified encoding decouples the PDE specification from model architecture, allows checkpoints to be shared between online and offline paths, and makes the OOD feature vector directly interpretable.
+
+Note: channel 4 is not a numerically estimated normal-flux field. In the current implementation it repeats the BC right-hand side on Neumann/Robin walls together with the `(alpha, beta)` coefficients, so the boundary operator is represented consistently with the pretrained checkpoints.
 
 ### 6. Checkpoint formats
 

@@ -37,7 +37,7 @@ FD path  (solver_type="fd" or no FNO model available)
     Finite difference iterative solver using Jacobi relaxation.
 
 PINN path  (solver_type="pinn")
-    Trains a ConditionalPINN2D (optional warm-start from a state-dict).
+    Trains a SharedConditionalPINN2D (optional warm-start from a state-dict).
 
 Offline training
 ----------------
@@ -64,17 +64,24 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from models.checkpoints import load_model_weights, read_checkpoint_arch
 from models.conditional_inputs import ConditionalGrid2D
-from models.conditional_solvers import ConditionalFNO2D, ConditionalPINN2D, SharedConditionalPINN2D, _PointwiseConditionalPINNNet
+from models.conditional_solvers import ConditionalFNO2D, SharedConditionalPINN2D, _PointwiseConditionalPINNNet
 from models.fno_model import FNO2DModel
 from ood_detector import OODDetector
 from pde_parser import ParsedPDE, parse_bc, parse_pde
-from physics.pde_helpers import GeneralPDE
+from physics.pde_helpers import GeneralPDE, solve_fd_jacobi
 from typing import Any, Literal
 
 
 @dataclass
 class GridConfig:
     n_points: int = 64
+
+    def __post_init__(self) -> None:
+        if self.n_points < 4:
+            raise ValueError(
+                f"GridConfig.n_points must be >= 4 (one-sided BC stencil needs "
+                f"at least 3 interior points); got {self.n_points}."
+            )
 
 
 @dataclass
@@ -224,8 +231,15 @@ class _FNOSolver(_AbstractSolver):
         with torch.no_grad():
             u = self.model(grid.input_grid).squeeze(0).squeeze(-1)
 
-        residual = float(pde_obj.compute_pde_loss(u).item())
-        bc_err = float(pde_obj.compute_bc_loss(u, grid.x_1d, grid.y_1d).item())
+        # FNO output is a 2-D spatial snapshot; computing a PDE residual that
+        # includes a time-derivative term (g·u_t) against tt=None is meaningless.
+        # Guard here catches any path that bypasses the top-level solve() check.
+        if pde_obj.parsed_pde.is_time_dependent:
+            residual = float("nan")
+            bc_err = float("nan")
+        else:
+            residual = float(pde_obj.compute_pde_loss(u).item())
+            bc_err = float(pde_obj.compute_bc_loss(u, grid.x_1d, grid.y_1d).item())
         return SolveResult(
             u=u.cpu().numpy(),
             xx=grid.xx.cpu().numpy(),
@@ -254,73 +268,20 @@ class _FDSolver(_AbstractSolver):
 
         Returns (u, xx, yy, history)
         """
-        from pde_parser import build_fd_residual
-        
-        x_1d = torch.linspace(0, 1, n_points, device=self.device)
-        y_1d = torch.linspace(0, 1, n_points, device=self.device)
-        xx, yy = torch.meshgrid(x_1d, y_1d, indexing="ij")
-
-        # Initialize solution with boundary conditions
-        u = torch.zeros((n_points, n_points), device=self.device, dtype=torch.float32)
-        u = pde_obj.apply_boundary_conditions(u, x_1d, y_1d)
-
-        residual_fn = build_fd_residual(pde_obj.parsed_pde)
-        history = []
-
-        # Jacobi diagonal: ∂R/∂u[i,j] — same stencil logic as build_fd_residual.
-        # Only the u[i,j]-touching terms contribute:
-        #   a*u_xx → -2*a/h²,  b*u_yy → -2*b/h²,  f*u → f_coef
-        # c/d/e use purely off-diagonal neighbours (central differences), so
-        # they do not appear in the diagonal.
-        h = 1.0 / (n_points - 1)
-        parsed = pde_obj.parsed_pde
-        n_int = n_points - 2
-        diag = torch.zeros((n_int, n_int), device=self.device, dtype=torch.float32)
-        if parsed.a != 0.0:
-            diag = diag + parsed.a * (-2.0 / h**2)
-        if parsed.b != 0.0:
-            diag = diag + parsed.b * (-2.0 / h**2)
-        if parsed.f != 0.0:
-            diag = diag + parsed.f
-        if (diag.abs() < 1e-14).any():
-            raise ValueError(
-                "Degenerate FD stencil: the diagonal coefficient is zero at one or more "
-                "interior points (a ≈ 0, b ≈ 0, and f ≈ 0). "
-                "Jacobi relaxation cannot proceed."
-            )
-
         print(f"FD solver: {n_points}×{n_points} grid, max {max_iterations} iterations")
-
-        for it in range(max_iterations):
-            u_old = u.clone()
-
-            # Compute residual at interior points: R = L(u) - rhs
-            residual = residual_fn(u)
-
-            # Jacobi update: u_new = u - R / (dR/du[i,j])
-            u[1:-1, 1:-1] = u[1:-1, 1:-1] - residual / diag
-
-            # Reapply boundary conditions
-            u = pde_obj.apply_boundary_conditions(u, x_1d, y_1d)
-
-            # Detect divergence early
-            if torch.isnan(u).any() or torch.isinf(u).any():
-                print(f"  FD solver diverged at iteration {it}.")
-                u = torch.nan_to_num(u, nan=0.0, posinf=0.0, neginf=0.0)
-                u = pde_obj.apply_boundary_conditions(u, x_1d, y_1d)
-                break
-
-            # Compute convergence metric
-            change = torch.max(torch.abs(u - u_old)).item()
-            rms_residual = torch.sqrt(torch.mean(residual**2)).item()
-            history.append(rms_residual)
-
-            if it % print_every == 0:
-                print(f"  Iter {it}: residual={rms_residual:.3e}, change={change:.3e}")
-
-            if change < tolerance:
-                print(f"  Converged after {it} iterations")
-                break
+        u, xx, yy, history = solve_fd_jacobi(
+            pde_obj=pde_obj,
+            n_points=n_points,
+            device=self.device,
+            max_iterations=max_iterations,
+            tolerance=tolerance,
+            print_every=print_every,
+            sanitize_on_divergence=True,
+        )
+        if u is None:
+            raise RuntimeError("FD solver failed to produce a solution.")
+        if history and history[-1] < tolerance:
+            print(f"  Converged after {len(history) - 1} iterations")
 
         return (
             u.cpu().numpy(),
@@ -372,53 +333,16 @@ class InferenceEngine:
 
     Parameters
     ----------
-    model_path : str | None
-        Path to conditional FNO weights (`.pt` state dict) or TorchScript archive.
-        Pass None to skip loading FNO.
-    pinn_model_path : str | None
-        Optional path to PINN weights (state dict or TorchScript).
-        Used as secondary fallback when FNO/JIT path is unavailable.
-    width, n_modes, n_layers : FNO architecture — must match training.
-    device : str, optional
+    solver_option : SolverOption
+        Full solver configuration.  Use the :class:`SolverOption`,
+        :class:`FNOConfig`, :class:`PINNConfig`, and :class:`FDConfig`
+        dataclasses to build the configuration.
     """
 
     def __init__(
         self,
-        solver_option: SolverOption | None = None,
-        model_path: str | None = None,
-        pinn_model_path: str | None = None,
-        enable_pinn: bool = False,
-        pinn_hidden: int = 64,
-        pinn_layers: int = 4,
-        width: int = 32,
-        n_modes: tuple = (12, 12),
-        n_layers: int = 4,
-        device: str | None = None,
+        solver_option: SolverOption,
     ):
-        # Legacy arguments are still accepted; they are mapped to SolverOption.
-        if solver_option is None:
-            if enable_pinn:
-                solver_type = "pinn"
-            elif model_path is not None:
-                solver_type = "fno"
-            else:
-                solver_type = "fd"
-            solver_option = SolverOption(
-                solver_type=solver_type,
-                fno=FNOConfig(
-                    model_path=model_path,
-                    width=width,
-                    n_modes=(int(n_modes[0]), int(n_modes[1])),
-                    n_layers=n_layers,
-                ),
-                pinn=PINNConfig(
-                    model_path=pinn_model_path,
-                    hidden=pinn_hidden,
-                    n_layers=pinn_layers,
-                ),
-                device=device,
-            )
-
         self.options = solver_option
         self.device = torch.device(
             self.options.device
@@ -447,16 +371,19 @@ class InferenceEngine:
             ).to(self.device)
             if self.options.fno.model_path is not None:
                 p = Path(self.options.fno.model_path)
-                if _is_torchscript(p):
-                    self._jit_model = torch.jit.load(str(p), map_location=self.device)
-                    self._jit_model.eval()
-                    print(f"Loaded TorchScript FNO from {p}")
+                if p.exists():
+                    if _is_torchscript(p):
+                        self._jit_model = torch.jit.load(str(p), map_location=self.device)
+                        self._jit_model.eval()
+                        print(f"Loaded TorchScript FNO from {p}")
+                    else:
+                        load_model_weights(self._model, str(p), self.device)
+                        self._model.eval()
+                        if hasattr(torch, "compile"):
+                            self._model = torch.compile(self._model, mode="reduce-overhead")
+                        print(f"Loaded conditional FNO from {p}")
                 else:
-                    load_model_weights(self._model, str(p), self.device)
-                    self._model.eval()
-                    if hasattr(torch, "compile"):
-                        self._model = torch.compile(self._model, mode="reduce-overhead")
-                    print(f"Loaded conditional FNO from {p}")
+                    print(f"FNO model path {p} not found; solve() will fall back to online training.")
             manifest = self.options.fno.manifest_path
             if manifest is not None and OODDetector.is_available(manifest):
                 self._ood_detector = OODDetector(manifest)
@@ -468,14 +395,18 @@ class InferenceEngine:
                 n_layers=self.options.pinn.n_layers,
             ).to(self.device)
             if self.options.pinn.model_path is not None:
-                load_model_weights(
-                    self._pinn_net,
-                    self.options.pinn.model_path,
-                    self.device,
-                    skip_if_torchscript=True,
-                )
-                self._pinn_net.eval()
-                print(f"Loaded PINN model from {self.options.pinn.model_path}")
+                p = Path(self.options.pinn.model_path)
+                if p.exists():
+                    load_model_weights(
+                        self._pinn_net,
+                        self.options.pinn.model_path,
+                        self.device,
+                        skip_if_torchscript=True,
+                    )
+                    self._pinn_net.eval()
+                    print(f"Loaded PINN model from {self.options.pinn.model_path}")
+                else:
+                    print(f"PINN model path {p} not found; solve() will fall back to online training.")
             manifest = self.options.pinn.manifest_path
             if manifest is not None and OODDetector.is_available(manifest):
                 self._ood_detector = OODDetector(manifest)
@@ -516,6 +447,12 @@ class InferenceEngine:
         # --- 1. Parse ---
         parsed_pde = parse_pde(pde_str)
         bc_specs   = parse_bc(bc_dict)
+
+        if parsed_pde.is_time_dependent:
+            raise NotImplementedError(
+                "Time-dependent PDEs are not supported by the current inference paths. "
+                "The active FNO/PINN/FD solvers only handle steady-state problems."
+            )
 
         ic_specs = None
         if ic_str and parsed_pde.is_time_dependent:
@@ -562,7 +499,7 @@ class InferenceEngine:
                     lam_phys=lam_phys_eff, lam_bc=lam_bc_eff,
                     n_epochs=pinn_epochs_eff, lr=pinn_lr_eff,
                     print_every=print_every_eff,
-                    pretrained_path=None,
+                    pretrained_path=fno_cfg.model_path,
                 )
             # OOD gate: check before running the FNO forward pass
             if self._ood_detector is not None:
@@ -576,6 +513,7 @@ class InferenceEngine:
                     )
                     fd_result.is_ood    = True
                     fd_result.ood_reason = ood_reason
+                    fd_result.method    = "fd_fallback"
                     return fd_result
 
             if self._jit_model is not None:
@@ -609,6 +547,7 @@ class InferenceEngine:
                     )
                     fd_result.is_ood    = True
                     fd_result.ood_reason = ood_reason
+                    fd_result.method    = "fd_fallback"
                     return fd_result
             print("Using PINN solver (offline)...")
             return self._pinn_path(
@@ -842,10 +781,7 @@ class InferenceEngine:
         early_stop_tol: float = 1e-6,
     ) -> SolveResult:
         """Per-problem online PINN training when no pre-trained weights are available."""
-        model_cls = SharedConditionalPINN2D if _is_shared_pinn_checkpoint(
-            self._pinn_model_path, self.device
-        ) else ConditionalPINN2D
-        model = model_cls(
+        model = SharedConditionalPINN2D(
             parsed_pde=pde_obj.parsed_pde,
             bc_specs=pde_obj.bc_specs,
             ic_specs=pde_obj.ic_specs,

@@ -122,10 +122,17 @@ class BCGenerator:
         if k_values is None:
             k_values = [1, 2, 3]
 
+        # Robin BCs require α > 0 for well-posedness. A negative amplitude on
+        # the value expression can combine with positive α to create an
+        # ill-conditioned system. Always use the absolute value so that the
+        # sign of the BC value is embedded in the randomly chosen expression
+        # template (e.g. sin/cos oscillate naturally) rather than the scale.
+        safe_amplitude = abs(amplitude_scale)
+
         bc_dict: dict[str, dict] = {}
         for wall in ["left", "right", "top", "bottom"]:
             tangent = cls._WALL_TANGENT[wall]
-            val_expr = cls._random_expr(tangent, amplitude_scale, k_values, rng)
+            val_expr = cls._random_expr(tangent, safe_amplitude, k_values, rng)
             r = float(rng.uniform())
             if r < neumann_prob:
                 bc_dict[wall] = {"type": "neumann", "value": val_expr}

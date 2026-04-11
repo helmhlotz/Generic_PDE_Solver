@@ -59,6 +59,7 @@ from inference_engine import (
     SolverOption,
 )
 from pde_parser import parse_bc, parse_pde
+from physics.pde_helpers import compute_sample_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -95,11 +96,7 @@ def _compute_metrics(
     result: SolveResult,
 ) -> EvalMetrics:
     """Compute error metrics between prediction and FD reference."""
-    diff = u_pred - u_fd
-    fd_norm = np.linalg.norm(u_fd)
-    rel_l2 = float(np.linalg.norm(diff) / (fd_norm + 1e-12))
-    rmse = float(np.sqrt(np.mean(diff ** 2)))
-    max_err = float(np.max(np.abs(diff)))
+    rel_l2, rmse, max_err = compute_sample_metrics(u_pred, u_fd)
     return EvalMetrics(
         rel_l2=rel_l2,
         rmse=rmse,
@@ -167,15 +164,16 @@ def evaluate_dataset(
             n_failed += 1
             continue
 
-        # Interpolate/crop FD target to match output resolution if needed
+        # Evaluation should compare like-for-like grids; a mismatch usually
+        # means the inference resolution does not match the dataset resolution.
         u_pred = result.u
         if u_pred.shape != u_fd.shape:
-            # Simple approach: crop/pad to the smaller size (nearest)
-            n_pred = u_pred.shape[0]
-            n_fd = u_fd.shape[0]
-            n_min = min(n_pred, n_fd)
-            u_pred = u_pred[:n_min, :n_min]
-            u_fd_cmp = u_fd[:n_min, :n_min]
+            print(
+                f"  Sample {i}: skipped due to resolution mismatch "
+                f"(prediction {u_pred.shape} vs FD target {u_fd.shape})"
+            )
+            n_failed += 1
+            continue
         else:
             u_fd_cmp = u_fd
 

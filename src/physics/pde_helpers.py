@@ -1,108 +1,113 @@
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 from pde_parser import ParsedBC, ParsedIC, ParsedPDE, build_fd_residual
 
 
-def _first_derivatives(field):
-    dx = 1.0 / (field.shape[0] - 1)
-    dy = 1.0 / (field.shape[1] - 1)
-    dfield_dx = (field[2:, 1:-1] - field[:-2, 1:-1]) / (2.0 * dx)
-    dfield_dy = (field[1:-1, 2:] - field[1:-1, :-2]) / (2.0 * dy)
-    return dfield_dx, dfield_dy
+def compute_sample_metrics(
+    u_pred: np.ndarray,
+    u_fd: np.ndarray,
+) -> tuple[float, float, float]:
+    """Return ``(rel_l2, rmse, max_err)`` for a prediction vs FD reference pair.
 
+    Both arrays are cast to float64 before comparison.  The relative L2 error
+    is stabilised against zero-norm references with a small epsilon.
 
-def _second_derivatives(field):
-    dx = 1.0 / (field.shape[0] - 1)
-    dy = 1.0 / (field.shape[1] - 1)
-    d2_dx2 = (field[2:, 1:-1] - 2.0 * field[1:-1, 1:-1] + field[:-2, 1:-1]) / dx**2
-    d2_dy2 = (field[1:-1, 2:] - 2.0 * field[1:-1, 1:-1] + field[1:-1, :-2]) / dy**2
-    return d2_dx2, d2_dy2
-
-
-class LaplacePDE:
-    """Laplace equation on [0,1]^2.
-
-    Boundary: u=0 on left/right/bottom, u=sin(πx) on top.
-    Exact solution: sin(πx)·sinh(πy)/sinh(π).
+    Parameters
+    ----------
+    u_pred : predicted solution array (any shape).
+    u_fd   : finite-difference reference array (same shape as u_pred).
     """
+    u_pred = np.asarray(u_pred, dtype=np.float64)
+    u_fd   = np.asarray(u_fd,   dtype=np.float64)
+    diff   = u_pred - u_fd
+    fd_norm = float(np.linalg.norm(u_fd))
+    rel_l2  = float(np.linalg.norm(diff) / (fd_norm + 1e-12))
+    rmse    = float(np.sqrt(np.mean(diff ** 2)))
+    max_err = float(np.max(np.abs(diff)))
+    return rel_l2, rmse, max_err
 
-    def compute_pde_loss(self, u):
-        d2u_dx2, d2u_dy2 = _second_derivatives(u)
-        return torch.mean((d2u_dx2 + d2u_dy2) ** 2)
 
-    def compute_bc_loss(self, u, x_1d):
-        target_top = torch.sin(torch.pi * x_1d)
-        return (
-            torch.mean(u[0, :] ** 2)
-            + torch.mean(u[-1, :] ** 2)
-            + torch.mean(u[:, 0] ** 2)
-            + torch.mean((u[:, -1] - target_top) ** 2)
+def solve_fd_jacobi(
+    pde_obj: "GeneralPDE",
+    n_points: int,
+    device: torch.device,
+    max_iterations: int = 5000,
+    tolerance: float = 1e-5,
+    print_every: int | None = None,
+    sanitize_on_divergence: bool = False,
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, list[float]]:
+    """Shared Jacobi FD solver used by both training and inference."""
+    x_1d = torch.linspace(0, 1, n_points, device=device)
+    y_1d = torch.linspace(0, 1, n_points, device=device)
+    xx, yy = torch.meshgrid(x_1d, y_1d, indexing="ij")
+
+    u = torch.zeros((n_points, n_points), device=device, dtype=torch.float32)
+    u = pde_obj.apply_boundary_conditions(u, x_1d, y_1d)
+    residual_fn = build_fd_residual(pde_obj.parsed_pde)
+
+    parsed = pde_obj.parsed_pde
+    h = 1.0 / (n_points - 1)
+    diag = torch.zeros((n_points - 2, n_points - 2), device=device, dtype=torch.float32)
+    if parsed.a != 0.0:
+        diag = diag + parsed.a * (-2.0 / h**2)
+    if parsed.b != 0.0:
+        diag = diag + parsed.b * (-2.0 / h**2)
+    if parsed.f != 0.0:
+        diag = diag + parsed.f
+
+    # Account for the implicit dependence of Robin/Neumann boundary values on
+    # the adjacent interior points when forming the Jacobi diagonal.
+    for wall, spec in pde_obj.bc_specs.items():
+        alpha_w, beta_w = spec.alpha, spec.beta
+        if beta_w == 0.0:
+            continue
+        denom_w = alpha_w + 3.0 * beta_w / (2.0 * h)
+        if abs(denom_w) < 1e-14:
+            continue
+        coupling = 4.0 * beta_w / (h * denom_w)
+        if wall == "left":
+            diag[0, :] = diag[0, :] + parsed.a * coupling / h**2
+        elif wall == "right":
+            diag[-1, :] = diag[-1, :] + parsed.a * coupling / h**2
+        elif wall == "bottom":
+            diag[:, 0] = diag[:, 0] + parsed.b * coupling / h**2
+        else:
+            diag[:, -1] = diag[:, -1] + parsed.b * coupling / h**2
+
+    if (diag.abs() < 1e-14).any():
+        raise ValueError(
+            "Degenerate FD stencil: the diagonal coefficient is zero at one or more "
+            "interior points (a ≈ 0, b ≈ 0, and f ≈ 0). Jacobi relaxation cannot proceed."
         )
 
-    def exact_solution(self, xx, yy):
-        pi = torch.tensor(torch.pi, device=xx.device, dtype=xx.dtype)
-        return torch.sin(pi * xx) * torch.sinh(pi * yy) / torch.sinh(pi)
+    history: list[float] = []
+    for it in range(max_iterations):
+        u_old = u.clone()
+        residual = residual_fn(u)
+        u[1:-1, 1:-1] = u[1:-1, 1:-1] - residual / diag
+        u = pde_obj.apply_boundary_conditions(u, x_1d, y_1d)
 
+        if torch.isnan(u).any() or torch.isinf(u).any():
+            if sanitize_on_divergence:
+                u = torch.nan_to_num(u, nan=0.0, posinf=0.0, neginf=0.0)
+                u = pde_obj.apply_boundary_conditions(u, x_1d, y_1d)
+                return u.detach(), xx, yy, history
+            return None, xx, yy, history
 
-class NavierStokesPDE:
-    """Incompressible Navier-Stokes for a lid-driven cavity.
+        change = torch.max(torch.abs(u - u_old)).item()
+        rms_residual = torch.sqrt(torch.mean(residual**2)).item()
+        history.append(rms_residual)
 
-    Boundary: u=lid_velocity on top wall, no-slip on all other walls.
-    """
+        if print_every is not None and (it % print_every == 0):
+            print(f"  Iter {it}: residual={rms_residual:.3e}, change={change:.3e}")
 
-    def __init__(self, viscosity: float, density: float, lid_velocity: float):
-        self.viscosity = viscosity
-        self.density = density
-        self.lid_velocity = lid_velocity
+        if change < tolerance:
+            break
 
-    def compute_pde_loss(self, fields):
-        u_vel, v_vel, pressure = fields["u"], fields["v"], fields["p"]
-
-        du_dx, du_dy = _first_derivatives(u_vel)
-        dv_dx, dv_dy = _first_derivatives(v_vel)
-        dp_dx, dp_dy = _first_derivatives(pressure)
-        d2u_dx2, d2u_dy2 = _second_derivatives(u_vel)
-        d2v_dx2, d2v_dy2 = _second_derivatives(v_vel)
-
-        u_c = u_vel[1:-1, 1:-1]
-        v_c = v_vel[1:-1, 1:-1]
-
-        continuity = du_dx + dv_dy
-        momentum_x = (
-            u_c * du_dx + v_c * du_dy
-            + dp_dx / self.density
-            - self.viscosity * (d2u_dx2 + d2u_dy2)
-        )
-        momentum_y = (
-            u_c * dv_dx + v_c * dv_dy
-            + dp_dy / self.density
-            - self.viscosity * (d2v_dx2 + d2v_dy2)
-        )
-
-        return (
-            torch.mean(continuity ** 2)
-            + torch.mean(momentum_x ** 2)
-            + torch.mean(momentum_y ** 2)
-        )
-
-    def compute_bc_loss(self, fields, x_1d):
-        u_vel, v_vel, pressure = fields["u"], fields["v"], fields["p"]
-        lid_target = torch.full_like(x_1d, self.lid_velocity)
-
-        velocity_bc = (
-            torch.mean(u_vel[0, :] ** 2)
-            + torch.mean(u_vel[-1, :] ** 2)
-            + torch.mean(u_vel[:, 0] ** 2)
-            + torch.mean((u_vel[:, -1] - lid_target) ** 2)
-            + torch.mean(v_vel[0, :] ** 2)
-            + torch.mean(v_vel[-1, :] ** 2)
-            + torch.mean(v_vel[:, 0] ** 2)
-            + torch.mean(v_vel[:, -1] ** 2)
-        )
-        pressure_anchor = torch.mean(pressure[1:-1, 1:-1]) ** 2
-        return velocity_bc + pressure_anchor
+    return u.detach(), xx, yy, history
 
 
 class GeneralPDE:

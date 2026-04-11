@@ -24,3 +24,5 @@ pretrained_models/fno_train_data.npz
 pretrained_models/fno_val_data.npz
 pretrained_models/fno_train_data_chunk_*.npz
 pretrained_models/datasets/
+
+files*

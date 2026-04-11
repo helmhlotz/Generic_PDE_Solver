@@ -22,7 +22,7 @@ import streamlit as st
 # Ensure src/ is importable
 sys.path.insert(0, str(Path(__file__).parent))
 
-from pde_parser import parse_pde, parse_bc, parse_ic
+from pde_parser import parse_pde, parse_bc
 from inference_engine import (
     InferenceEngine,
     SolverOption,
@@ -136,11 +136,15 @@ with st.sidebar:
     if solver_type == "FNO":
         pinn_epochs = 3000  # unused when FNO
     elif solver_type == "PINN":
-        pinn_epochs = st.number_input(
-            "Training epochs",
-            min_value=100, max_value=10000, value=3000, step=100,
-            help="Number of gradient steps for the MLP PINN.",
-        )
+        if use_pretrained and pinn_path:
+            pinn_epochs = 3000  # offline forward pass — no training loop runs
+            st.info("Training epochs not applicable when using a pretrained PINN (offline forward pass).")
+        else:
+            pinn_epochs = st.number_input(
+                "Training epochs",
+                min_value=100, max_value=10000, value=3000, step=100,
+                help="Number of gradient steps for the MLP PINN.",
+            )
     else:
         pinn_epochs = 3000
 
@@ -153,7 +157,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 st.subheader("PDE")
 st.markdown(
-    "**Symbols:** `x`, `y`, `u`, `u_x`, `u_y`, `u_xx`, `u_yy`, `u_xy`, `u_t`, "
+    "**Symbols:** `x`, `y`, `u`, `u_x`, `u_y`, `u_xx`, `u_yy`, `u_xy`, "
     "`pi`, `sin`, `cos`, `exp`, `sqrt`"
 )
 
@@ -214,30 +218,12 @@ try:
 except Exception as exc:
     st.warning(f"BC parse error: {exc}")
 
-# Initial Condition (for time-dependent PDEs)
+# Time-dependent PDEs are parsed but not supported by the active solver paths.
 ic_str = ""
-ic_ok = False
-ic_specs = None
+ic_ok = True
 if pde_ok and parsed_pde.is_time_dependent:
-    st.subheader("Initial Condition")
-    if parsed_pde.has_time_derivative:
-        ic_help = "Initial condition u(x,y,t=0). Use symbols: x, y, sin, cos, exp, sqrt, pi, etc."
-    else:
-        ic_help = "This PDE depends on time through t. Provide an initial state u(x,y,t=0)."
-    ic_str = st.text_input(
-        "u(x,y,0)",
-        value="0",
-        key="ic_input",
-        label_visibility="collapsed",
-        help=ic_help,
-    )
-    try:
-        ic_specs = parse_ic(ic_str)
-        ic_ok = True
-    except Exception as exc:
-        st.warning(f"IC parse error: {exc}")
-else:
-    ic_ok = True  # No IC needed for steady-state PDEs
+    st.error("Time-dependent PDEs are not supported yet. Please enter a steady-state PDE.")
+    ic_ok = False
 
 # ---------------------------------------------------------------------------
 # Solve button
