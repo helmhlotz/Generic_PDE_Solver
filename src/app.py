@@ -1,4 +1,4 @@
-"""Streamlit web UI for generalized PINN/FNO inference.
+"""Streamlit web UI for thermal-focused scalar PINN/FNO inference.
 
 Launch:
     cd /path/to/FNO
@@ -36,28 +36,29 @@ from inference_engine import (
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Generalized PDE Solver",
+    page_title="2D Thermal PDE Solver",
     page_icon="",
     layout="wide",
 )
 
-st.title("Generalized PDE Solver")
+st.title("2D Thermal PDE Solver")
 st.caption(
-    "Type any scalar PDE and boundary conditions. "
+    "Thermal-focused scalar PDE sandbox (steady-state). "
+    "You can still enter any supported scalar PDE and boundary conditions. "
     "The conditional FNO gives an instant prediction; "
     "run `python src/trainer.py fno` to update the model."
 )
 # ---------------------------------------------------------------------------
 
-def _derive_manifest_path(model_path: str) -> str | None:
-    """Return the OOD manifest path for a given FNO model path, or None if absent.
+def _derive_manifest_path(model_path: str, solver_tag: str = "fno") -> str | None:
+    """Return an OOD manifest path for a model path, or None if absent.
 
-    Looks for ``<model_dir>/fno_manifest.npz`` first (the default name written
-    by ``trainer.py fno-generate``), then tries ``<model_stem>_manifest.npz``.
+    Looks for ``<model_dir>/<solver_tag>_manifest.npz`` first, then tries
+    ``<model_stem>_manifest.npz``.
     """
     p = Path(model_path)
     candidates = [
-        p.parent / "fno_manifest.npz",
+        p.parent / f"{solver_tag}_manifest.npz",
         p.with_name(p.stem + "_manifest.npz"),
     ]
     for c in candidates:
@@ -82,7 +83,7 @@ _WALLS = ["left", "right", "bottom", "top"]
 with st.sidebar:
     st.header("Settings")
 
-    n_points = st.slider("Grid resolution (n×n)", min_value=16, max_value=512, value=50, step=1)
+    n_points = st.slider("Grid resolution (n×n)", min_value=16, max_value=512, value=64, step=1)
 
     st.divider()
     st.subheader("Solver")
@@ -114,17 +115,51 @@ with st.sidebar:
         fno_path = ""
         pinn_path = ""
 
-    # Model-specific architecture configuration
+    with st.expander("FD / Fallback configuration", expanded=False):
+        fd_max_iterations = st.number_input(
+            "FD max iterations",
+            min_value=100,
+            max_value=20000,
+            value=5000,
+            step=100,
+            help="Used for FD solver mode and OOD fallback FD runs.",
+        )
+        fd_tolerance = st.number_input(
+            "FD tolerance",
+            min_value=1e-8,
+            max_value=1e-2,
+            value=1e-5,
+            format="%.1e",
+            help="Convergence threshold for FD solver updates.",
+        )
+        fd_print_every = st.number_input(
+            "FD print every",
+            min_value=10,
+            max_value=5000,
+            value=500,
+            step=10,
+            help="Progress logging interval for FD iterations.",
+        )
+
+    # Model-specific architecture configuration (only when training from scratch)
     if solver_type == "FNO":
-        with st.expander("FNO configuration", expanded=False):
-            fno_width  = st.number_input("Channel width",         value=32, min_value=8,  step=8,  key="fno_width")
-            fno_modes  = st.number_input("Fourier modes per dim", value=12, min_value=4,  step=2,  key="fno_modes")
-            fno_layers = st.number_input("FNO blocks",            value=4,  min_value=1,  step=1,  key="fno_layers")
+        if not use_pretrained:
+            with st.expander("FNO configuration", expanded=False):
+                fno_width  = st.number_input("Channel width",         value=32, min_value=8,  step=8,  key="fno_width")
+                fno_modes  = st.number_input("Fourier modes per dim", value=12, min_value=4,  step=2,  key="fno_modes")
+                fno_layers = st.number_input("FNO blocks",            value=4,  min_value=1,  step=1,  key="fno_layers")
+        else:
+            fno_width, fno_modes, fno_layers = 32, 12, 4
+            st.caption("Using pretrained FNO: architecture controls are hidden.")
         pinn_hidden, pinn_layers_n = 64, 4
     elif solver_type == "PINN":
-        with st.expander("PINN configuration", expanded=False):
-            pinn_hidden   = st.number_input("Hidden units per layer", value=64, min_value=16, step=16, key="pinn_hidden")
-            pinn_layers_n = st.number_input("Number of layers",       value=4,  min_value=2,  step=1,  key="pinn_layers")
+        if not use_pretrained:
+            with st.expander("PINN configuration", expanded=False):
+                pinn_hidden   = st.number_input("Hidden units per layer", value=64, min_value=16, step=16, key="pinn_hidden")
+                pinn_layers_n = st.number_input("Number of layers",       value=4,  min_value=2,  step=1,  key="pinn_layers")
+        else:
+            pinn_hidden, pinn_layers_n = 64, 4
+            st.caption("Using pretrained PINN: architecture controls are hidden.")
         fno_width, fno_modes, fno_layers = 32, 12, 4
     else:
         fno_width, fno_modes, fno_layers = 32, 12, 4
@@ -132,9 +167,24 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Training")
+    fno_online_epochs = 3000
+    fno_online_lr = 1e-3
 
     if solver_type == "FNO":
-        pinn_epochs = 3000  # unused when FNO
+        if use_pretrained and fno_path:
+            st.info("Training controls are disabled while using a pretrained FNO.")
+        else:
+            fno_online_epochs = st.number_input(
+                "Online training epochs (FNO)",
+                min_value=100, max_value=10000, value=2000, step=100,
+                help="Gradient steps for per-problem online FNO fitting when no FNO checkpoint is used.",
+            )
+            fno_online_lr = st.number_input(
+                "Online learning rate (FNO)",
+                min_value=1e-5, max_value=1e-1, value=1e-3, format="%.5f",
+                help="Learning rate for per-problem online FNO fitting.",
+            )
+        pinn_epochs = 3000
     elif solver_type == "PINN":
         if use_pretrained and pinn_path:
             pinn_epochs = 3000  # offline forward pass — no training loop runs
@@ -238,6 +288,11 @@ if st.button("Solve", type="primary", disabled=solve_disabled, use_container_wid
                     solver_type="fno",
                     device="cpu",
                     grid=GridConfig(n_points=int(n_points)),
+                    fd=FDConfig(
+                        max_iterations=int(fd_max_iterations),
+                        tolerance=float(fd_tolerance),
+                        print_every=int(fd_print_every),
+                    ),
                     fno=FNOConfig(
                         model_path=fno_path if (use_pretrained and fno_path) else None,
                         manifest_path=_derive_manifest_path(fno_path) if (use_pretrained and fno_path) else None,
@@ -265,8 +320,14 @@ if st.button("Solve", type="primary", disabled=solve_disabled, use_container_wid
                     solver_type="pinn",
                     device="cpu",
                     grid=GridConfig(n_points=int(n_points)),
+                    fd=FDConfig(
+                        max_iterations=int(fd_max_iterations),
+                        tolerance=float(fd_tolerance),
+                        print_every=int(fd_print_every),
+                    ),
                     pinn=PINNConfig(
                         model_path=pinn_path if (use_pretrained and pinn_path) else None,
+                        manifest_path=_derive_manifest_path(pinn_path, solver_tag="pinn") if (use_pretrained and pinn_path) else None,
                         hidden=int(pinn_hidden),
                         n_layers=int(pinn_layers_n),
                         epochs=int(pinn_epochs),
@@ -292,17 +353,29 @@ if st.button("Solve", type="primary", disabled=solve_disabled, use_container_wid
                     solver_type="fd",
                     device="cpu",
                     grid=GridConfig(n_points=int(n_points)),
-                    fd=FDConfig(print_every=500),
+                    fd=FDConfig(
+                        max_iterations=int(fd_max_iterations),
+                        tolerance=float(fd_tolerance),
+                        print_every=int(fd_print_every),
+                    ),
                 )
                 with st.expander("Solver config", expanded=False):
                     st.write(f"solver type: {solver_type}  |  grid n_points: {n_points}")
                 engine = InferenceEngine(solver_option=option)
 
             _t0 = time.perf_counter()
+            solve_kwargs = {
+                "pde_str": pde_str,
+                "bc_dict": bc_dict,
+                "ic_str": ic_str if parsed_pde.is_time_dependent else None,
+            }
+            if solver_type == "FNO" and not use_pretrained:
+                solve_kwargs["fno_epochs"] = int(fno_online_epochs)
+                solve_kwargs["fno_lr"] = float(fno_online_lr)
+            if solver_type == "PINN" and not (use_pretrained and pinn_path):
+                solve_kwargs["pinn_epochs"] = int(pinn_epochs)
             result = engine.solve(
-                pde_str=pde_str,
-                bc_dict=bc_dict,
-                ic_str=ic_str if parsed_pde.is_time_dependent else None,
+                **solve_kwargs,
             )
             _elapsed = time.perf_counter() - _t0
             with st.expander("Debug info", expanded=False):
@@ -429,70 +502,103 @@ if "result" in st.session_state:
         )
 
 # ---------------------------------------------------------------------------
-# Example presets (sidebar bottom)
+# Preset registry  (preset_id, domain, tags, description + pde/bc spec)
 # ---------------------------------------------------------------------------
+PRESET_REGISTRY = [
+    {
+        "preset_id":   "thermal_laplace",
+        "domain":      "Thermal",
+        "label":       "Thermal: Laplace conduction",
+        "tags":        ["steady-state", "conduction", "Dirichlet"],
+        "description": "Steady-state heat conduction with no internal sources; "
+                       "fixed temperatures on all walls.",
+        "pde": "u_xx + u_yy = 0",
+        "bc": {
+            "left":   {"type": "dirichlet", "value": "0"},
+            "right":  {"type": "dirichlet", "value": "0"},
+            "bottom": {"type": "dirichlet", "value": "0"},
+            "top":    {"type": "dirichlet", "value": "sin(pi*x)"},
+        },
+    },
+    {
+        "preset_id":   "thermal_poisson",
+        "domain":      "Thermal",
+        "label":       "Thermal: Poisson with heat generation",
+        "tags":        ["steady-state", "source-term", "Dirichlet"],
+        "description": "Steady-state conduction with a sinusoidal internal heat source "
+                       "(homogeneous Dirichlet on all walls).",
+        "pde": "u_xx + u_yy = -2*sin(pi*x)*sin(pi*y)",
+        "bc": {
+            "left":   {"type": "dirichlet", "value": "0"},
+            "right":  {"type": "dirichlet", "value": "0"},
+            "bottom": {"type": "dirichlet", "value": "0"},
+            "top":    {"type": "dirichlet", "value": "0"},
+        },
+    },
+    {
+        "preset_id":   "thermal_mixed_bc",
+        "domain":      "Thermal",
+        "label":       "Thermal: Mixed BC (Dirichlet/Neumann/Robin)",
+        "tags":        ["steady-state", "conduction", "Dirichlet", "Neumann", "Robin"],
+        "description": "Laplace conduction with mixed boundaries: fixed temperature (top), "
+                       "insulated no-flux (left/bottom), convective Robin on right wall.",
+        "pde": "u_xx + u_yy = 0",
+        "bc": {
+            "left":   {"type": "neumann",   "value": "0"},
+            "right":  {"type": "robin",     "value": "0", "alpha": "1.0", "beta": "1.0"},
+            "bottom": {"type": "neumann",   "value": "0"},
+            "top":    {"type": "dirichlet", "value": "1"},
+        },
+    },
+]
+
+
 def apply_preset(preset: dict) -> None:
-    """Apply preset values to session state before rerun."""
+    """Apply a PRESET_REGISTRY entry to session state before rerun."""
     st.session_state["pde_input"] = preset["pde"]
+    st.session_state["active_preset_id"] = preset["preset_id"]
     for wall, spec in preset["bc"].items():
         st.session_state[f"bc_type_{wall}"] = spec["type"]
         st.session_state[f"bc_val_{wall}"]  = spec.get("value", "0")
-        # Clear robin keys from previous presets
-        st.session_state.pop(f"bc_alpha_{wall}", None)
-        st.session_state.pop(f"bc_beta_{wall}", None)
+        if spec["type"] == "robin":
+            st.session_state[f"bc_alpha_{wall}"] = spec.get("alpha", "1.0")
+            st.session_state[f"bc_beta_{wall}"]  = spec.get("beta", "1.0")
+        else:
+            st.session_state.pop(f"bc_alpha_{wall}", None)
+            st.session_state.pop(f"bc_beta_{wall}", None)
 
 
 with st.sidebar:
     st.divider()
     st.subheader("Example presets")
 
-    presets = {
-        "Laplace (Dirichlet)": {
-            "pde": "u_xx + u_yy = 0",
-            "bc": {
-                "left":   {"type": "dirichlet", "value": "0"},
-                "right":  {"type": "dirichlet", "value": "0"},
-                "bottom": {"type": "dirichlet", "value": "0"},
-                "top":    {"type": "dirichlet", "value": "sin(pi*x)"},
-            },
-        },
-        "Poisson with source": {
-            "pde": "u_xx + u_yy = -2*sin(pi*x)*sin(pi*y)",
-            "bc": {
-                "left":   {"type": "dirichlet", "value": "0"},
-                "right":  {"type": "dirichlet", "value": "0"},
-                "bottom": {"type": "dirichlet", "value": "0"},
-                "top":    {"type": "dirichlet", "value": "0"},
-            },
-        },
-        "Helmholtz k²=4": {
-            "pde": "u_xx + u_yy + 4*u = 0",
-            "bc": {
-                "left":   {"type": "dirichlet", "value": "0"},
-                "right":  {"type": "dirichlet", "value": "0"},
-                "bottom": {"type": "dirichlet", "value": "0"},
-                "top":    {"type": "dirichlet", "value": "sin(pi*x)"},
-            },
-        },
-        "Neumann on left wall": {
-            "pde": "u_xx + u_yy = 0",
-            "bc": {
-                "left":   {"type": "neumann",   "value": "0"},
-                "right":  {"type": "dirichlet", "value": "1"},
-                "bottom": {"type": "dirichlet", "value": "0"},
-                "top":    {"type": "dirichlet", "value": "0"},
-            },
-        },
-        "Maxwell TE (driven cavity)": {
-            "pde": "u_xx + u_yy + 20*u = exp(-50*((x-0.5)**2 + (y-0.5)**2))",
-            "bc": {
-                "left":   {"type": "dirichlet", "value": "0"},
-                "right":  {"type": "dirichlet", "value": "0"},
-                "bottom": {"type": "dirichlet", "value": "0"},
-                "top":    {"type": "dirichlet", "value": "0"},
-            },
-        },
-    }
+    domains = sorted({p["domain"] for p in PRESET_REGISTRY})
+    selected_domain = st.selectbox("Preset domain", ["All"] + domains, index=0)
+    all_tags = sorted({tag for p in PRESET_REGISTRY for tag in p["tags"]})
+    selected_tags = st.multiselect("Preset tags", all_tags, default=[])
 
-    for label, preset in presets.items():
-        st.button(label, use_container_width=True, on_click=apply_preset, args=(preset,))
+    filtered_presets = [
+        p for p in PRESET_REGISTRY
+        if (selected_domain == "All" or p["domain"] == selected_domain)
+        and all(t in p["tags"] for t in selected_tags)
+    ]
+
+    if not filtered_presets:
+        st.info("No presets match the selected domain/tag filters.")
+
+    for preset in filtered_presets:
+        help_text = f"[{preset['domain']}] {preset['description']}"
+        st.button(
+            preset["label"],
+            use_container_width=True,
+            help=help_text,
+            on_click=apply_preset,
+            args=(preset,),
+            key=f"preset_btn_{preset['preset_id']}",
+        )
+
+    active_id = st.session_state.get("active_preset_id")
+    active = next((p for p in PRESET_REGISTRY if p["preset_id"] == active_id), None)
+    if active is not None:
+        st.caption(f"Active preset: `{active['preset_id']}`")
+        st.caption("Tags: " + ", ".join(active["tags"]))
