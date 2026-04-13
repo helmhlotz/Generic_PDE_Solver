@@ -50,6 +50,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -379,8 +380,14 @@ class InferenceEngine:
                     else:
                         load_model_weights(self._model, str(p), self.device)
                         self._model.eval()
-                        if hasattr(torch, "compile"):
+                        # torch.compile + FFT kernels can fail at runtime on some
+                        # backends/versions (stride/layout assertions in _fft_c2c).
+                        # Keep eager mode as the default for reliability; allow
+                        # opt-in compile via env var for benchmarking.
+                        enable_compile = os.getenv("FNO_ENABLE_TORCH_COMPILE", "0") == "1"
+                        if enable_compile and hasattr(torch, "compile"):
                             self._model = torch.compile(self._model, mode="reduce-overhead")
+                            print("Enabled torch.compile for FNO (FNO_ENABLE_TORCH_COMPILE=1)")
                         print(f"Loaded conditional FNO from {p}")
                 else:
                     print(f"FNO model path {p} not found; solve() will fall back to online training.")
@@ -421,6 +428,8 @@ class InferenceEngine:
         n_points: int | None = None,
         lambda_physics: float | None = None,
         lambda_bc: float | None = None,
+        fno_epochs: int | None = None,
+        fno_lr: float | None = None,
         pinn_epochs: int | None = None,
         pinn_lr: float | None = None,
         print_every: int | None = None,
@@ -435,6 +444,8 @@ class InferenceEngine:
         n_points        : grid resolution (n × n); defaults to GridConfig.n_points.
         lambda_physics  : physics-loss weight for PINN.
         lambda_bc       : BC-loss weight for PINN.
+        fno_epochs      : epochs for online FNO training (overrides FNO-online default).
+        fno_lr          : learning rate for online FNO training.
         pinn_epochs     : Adam epochs for the PINN path (overrides PINNConfig).
         pinn_lr         : learning rate for the PINN path (overrides PINNConfig).
         print_every     : log interval for iterative solvers.
@@ -479,6 +490,18 @@ class InferenceEngine:
                 fno_cfg.lambda_bc if solver_type == "fno" else pinn_cfg.lambda_bc
             )
         )
+        # Keep backward compatibility: when fno_* are omitted, fall back to
+        # legacy pinn_* overrides for the FNO online path.
+        fno_epochs_eff  = int(
+            fno_epochs if fno_epochs is not None else (
+                pinn_epochs if pinn_epochs is not None else pinn_cfg.epochs
+            )
+        )
+        fno_lr_eff      = float(
+            fno_lr if fno_lr is not None else (
+                pinn_lr if pinn_lr is not None else pinn_cfg.lr
+            )
+        )
         pinn_epochs_eff = int(pinn_epochs if pinn_epochs is not None else pinn_cfg.epochs)
         pinn_lr_eff     = float(pinn_lr if pinn_lr is not None else pinn_cfg.lr)
         print_every_eff = int(
@@ -497,7 +520,7 @@ class InferenceEngine:
                 return self._fno_online_path(
                     parsed_pde, bc_specs, pde_obj, source_fn, n_points_eff,
                     lam_phys=lam_phys_eff, lam_bc=lam_bc_eff,
-                    n_epochs=pinn_epochs_eff, lr=pinn_lr_eff,
+                    n_epochs=fno_epochs_eff, lr=fno_lr_eff,
                     print_every=print_every_eff,
                     pretrained_path=fno_cfg.model_path,
                 )

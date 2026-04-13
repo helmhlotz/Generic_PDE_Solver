@@ -21,11 +21,15 @@ The key design concern is **orchestration**: how offline training pipelines, run
 │  fno_train_data.npz   fno_val_data.npz                          │
 │  [inputs(N,64,64,7)   targets(N,64,64)   feats(N,25)]           │
 │       │                                                         │
-│       ├──► HybridFNOTrainer ──► fno.pt + fno_best.pt            │
+│       ├──► FNOTrainer ──► fno.pt + fno_best.pt                  │
 │       │      hybrid loss: data + physics + BC                   │
 │       │                                                         │
 │       ├──► PINNTrainer ──────► pinn.pt + pinn_best.pt           │
-│       │      multi-task: steps_per_problem × n_epochs           │
+│       │      dataset-driven; hybrid loss: data + physics + BC    │
+│       │      mirrors FNO loop (cosine LR + epoch validation)     │
+│       │                                                         │
+│       │   Both trainers share _DatasetTrainerBase               │
+│       │   (PDEOperatorDataset + DataLoader, auto 80/20 split)   │
 │       │                                                         │
 │       └──► OODDetector.build_manifest ──► fno_manifest.npz      │
 │              KNN threshold: 95th-percentile LOO distance        │
@@ -79,7 +83,8 @@ The key design concern is **orchestration**: how offline training pipelines, run
 src/
 ├── app.py                    Streamlit UI; builds SolverOption from widgets
 ├── launcher.py               PyInstaller-compatible entry point
-├── trainer.py                CLI + API for offline data generation and training
+├── trainer.py                CLI + API for data generation and training;
+│                              _DatasetTrainerBase shared loader abstraction for FNO + PINN
 ├── inference_engine.py       Runtime routing engine; all solve() paths
 ├── evaluate.py               Standalone FD-guardrail evaluation script
 ├── pde_parser.py             Sympy-based PDE and BC string parser
@@ -112,12 +117,12 @@ pretrained_models/
 
 ### 1. Offline data generation — parallel + fault-tolerant
 
-`trainer.py fno-generate` splits the LHS problem list into 200-sample chunks.
+`trainer.py generate` splits the LHS problem list into 200-sample chunks.
 Each chunk is solved in parallel via `ProcessPoolExecutor` (one process per CPU core) and immediately written to `<dataset>_chunk_NNNNNN.npz`.
 On re-run, existing chunks are loaded and skipped — the pipeline is safe to interrupt and resume.
 
 ```
-python src/trainer.py fno-generate \
+python src/trainer.py generate \
     --samples 5000 \
     --dataset-path pretrained_models/fno_train_data.npz \
     --n-workers 8          # default: cpu_count()
@@ -125,26 +130,49 @@ python src/trainer.py fno-generate \
 
 ### 2. Two-stage training
 
-Data generation and model training are decoupled, enabling independent reuse of each stage:
+Data generation and model training are decoupled, enabling independent reuse of each stage.
+
+Both `FNOTrainer` and `PINNTrainer` inherit `_DatasetTrainerBase`, which provides a single `_build_loaders_from_datasets()` method: it loads a `PDEOperatorDataset`, wraps it in a `DataLoader` (`batch_size=1`), and optionally performs a deterministic 80/20 train/val split when `--val-dataset` is omitted. Their train/test scaffolding is now mirrored through shared `_train_from_dataset()` and `_test_from_dataset()` paths, with solver-specific behavior isolated to small hook methods.
 
 ```bash
 # Stage 1 — generate once, reuse many times
-python src/trainer.py fno-generate --samples 5000 \
+python src/trainer.py generate --samples 5000 \
     --dataset-path pretrained_models/fno_train_data.npz
 
 # Stage 2a — train FNO (supervised + physics + BC hybrid loss)
-python src/trainer.py fno-train \
+python src/trainer.py train --solver fno \
     --train-dataset pretrained_models/fno_train_data.npz \
     --val-dataset   pretrained_models/fno_val_data.npz \
     --epochs 30
 
 # Stage 2b — train shared PINN on same dataset
-python src/trainer.py pinn \
+python src/trainer.py train --solver pinn \
     --train-dataset pretrained_models/fno_train_data.npz \
-    --steps-per-problem 3 --n-epochs 20
+    --epochs 20 --lam-data 1.0
+
+# Stage 3 — build OOD manifest as an explicit step
+python src/trainer.py manifest \
+    --train-dataset pretrained_models/fno_train_data.npz \
+    --val-dataset pretrained_models/fno_val_data.npz \
+    --out pretrained_models/fno_manifest.npz
+
+# Stage 4 — evaluate checkpoints
+python src/trainer.py test --solver fno \
+    --test-dataset pretrained_models/fno_val_data.npz \
+    --checkpoint pretrained_models/fno.pt
 
 # One-shot pipeline (generate + train in one command)
 python src/trainer.py fno --samples 5000 --epochs 30
+
+# Legacy aliases remain for backward compatibility but print a deprecation warning.
+# fno-generate  →  generate
+# fno-train     →  train --solver fno
+# fno           →  generate + train --solver fno
+# pinn          →  train --solver pinn
+# fno-test      →  test --solver fno
+# pinn-test     →  test --solver pinn
+# Note: --steps-per-problem is accepted for backward compatibility in PINN training,
+# but trainer.py now uses one dataset pass per epoch for both FNO and PINN.
 ```
 
 ### 3. Inference routing
@@ -256,13 +284,13 @@ Python 3.10–3.12. Install with `pip install -e .` from the repo root.
 ### Performance (partially done)
 - [ ] **PINN epoch callback → `st.progress()`** — Add `on_epoch` callback to `_pinn_online_path` and `SharedConditionalPINN2D.fit()`; wire to a Streamlit progress bar in `app.py`. Removes the silent spinner during 30–300 s online training.
 - [ ] **Pre-evaluate BC arrays before Jacobi loop** — `GeneralPDE.apply_boundary_conditions` calls sympy lambdas 5000 × 4 walls per solve. Pre-compute all four boundary value tensors once outside the loop and pass them in. ~30 lines across `pde_helpers.py` and `inference_engine.py`.
-- [ ] **Structured `logging`** — Replace ~80 `print()` calls across all `src/` modules with `logging.getLogger(__name__)`. Needed before HPC use where parallel-worker stdout is unmanageable.
+- [x] **Structured `logging`** — All progress output in `trainer.py` now uses `logging.getLogger(__name__)` (INFO/WARNING level) in place of `print()`. Formatted summary tables (`_print_test_summary`, `_print_smoke_summary`) remain as `print()` for human-readable terminal output.
 
 ### Scale
-- [ ] **`DataLoader`-based training** — `HybridFNOTrainer._load_examples()` loads the entire dataset as GPU tensors at startup (~546 MB for 5k, ~5.5 GB for 50k). Replace with `FNODataset(torch.utils.data.Dataset)` + `DataLoader(batch_size=32, pin_memory=True)`. Requires the physics loss functions in `pde_helpers.py` to accept batched tensors `(B, N, N)` — the central blocker.
-- [ ] **Pre-parse PDE/BC coefficients at generation time** — `_load_examples()` calls sympy `parse_pde()` per sample; at 50 ms × 50k samples = 40+ min before the first training step. Store the 6 parsed float coefficients (`a, b, c, d, e, f`) directly in the `.npz` at generation time in `_solve_one()`, then reconstruct `ParsedPDE` from floats in `_load_examples()`.
-- [ ] **HPC scheduler/worker** — Generation is already parallelisable with the current `ProcessPoolExecutor` setup. Training requires `DataLoader` + DDP + mid-run checkpointing (not yet implemented) before it can be distributed across nodes. Fix the `DataLoader` blocker first.
+- [x] **`DataLoader`-based training** — Both `FNOTrainer` and `PINNTrainer` now stream data through `PDEOperatorDataset` + `DataLoader(batch_size=1)` via `_DatasetTrainerBase._build_loaders_from_datasets()`. They now share mirrored `_train_from_dataset()` and `_test_from_dataset()` control flow (cosine scheduler + epoch validation in both). `batch_size > 1` remains blocked by the physics-loss batching requirement in `pde_helpers.py`.
+- [ ] **Pre-parse PDE/BC coefficients at generation time** — `_load_examples()` calls sympy `parse_pde()` per sample; at 50 ms × 50k samples = 40+ min before the first training step. Store the 6 parsed float coefficients (`a, b, c, d, e, f`) directly in the `.npz` at generation time in `_solve_one_worker()`, then reconstruct `ParsedPDE` from floats in `_load_examples()`.
+- [ ] **HPC scheduler/worker** — Generation is already parallelisable with the current `ProcessPoolExecutor` setup. Training uses `DataLoader` but still runs single-process; DDP + mid-run checkpointing are needed before it can be distributed across nodes.
 
 ### Future
-- [ ] **Fine-tune on more cases** — The offline training infrastructure is sound. Scaling to larger LHS samples is straightforward once `DataLoader` is in place and sympy pre-parsing removes the load-time bottleneck.
+- [ ] **Fine-tune on more cases** — The offline training infrastructure is sound. Scaling to larger LHS samples is straightforward once sympy pre-parsing removes the `_load_examples()` load-time bottleneck for the test path.
 - [ ] **N-D support** — `SpectralConv` and `SoftGating` in `fno_layers.py` are already fully N-D. Every layer from `ConditionalGrid2D` downward is 2D-hardcoded (`B, H, W, _` unpacking, 6 named 2D PDE coefficients, fixed `FEATURE_DIM=25` OOD manifest). Requires redesigning the input encoding, parser, and OOD featurizer simultaneously.
