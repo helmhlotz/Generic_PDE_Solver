@@ -143,7 +143,7 @@ class SharedFDDataGenerator:
         config: PDESpaceConfig | None = None,
         n_samples: int = 5000,
         seed: int = 42,
-        save_path: str = "pretrained_models/fno_train_data.npz",
+        save_path: str = "pretrained_models/train_data",
         max_iterations: int = 5000,
         tolerance: float = 1e-5,
         print_every: int = 200,
@@ -1270,9 +1270,9 @@ def _make_parser() -> argparse.ArgumentParser:
     gen_sub.add_argument("--resolution", type=int, default=64,
                          help="FD grid resolution n×n (default: 64)")
     gen_sub.add_argument("--seed", type=int, default=42)
-    gen_sub.add_argument("--dataset-path", type=str, default="pretrained_models/fno_train_data.npz")
+    gen_sub.add_argument("--dataset-path", type=str, default="pretrained_models/train_data")
     gen_sub.add_argument("--n-val", type=int, default=64)
-    gen_sub.add_argument("--val-dataset-path", type=str, default="pretrained_models/fno_val_data.npz")
+    gen_sub.add_argument("--val-dataset-path", type=str, default="pretrained_models/val_data")
     gen_sub.add_argument("--max-iterations", type=int, default=5000)
     gen_sub.add_argument("--tolerance", type=float, default=1e-5)
     gen_sub.add_argument("--print-every", type=int, default=200)
@@ -1330,7 +1330,7 @@ def _make_parser() -> argparse.ArgumentParser:
     man_sub = sub.add_parser("manifest", help="Build OOD manifest from dataset features")
     man_sub.add_argument("--train-dataset", type=str, required=True)
     man_sub.add_argument("--val-dataset", type=str, default=None)
-    man_sub.add_argument("--out", type=str, default="pretrained_models/fno_manifest.npz")
+    man_sub.add_argument("--out", type=str, default="pretrained_models/manifest.npz")
     man_sub.add_argument("--percentile", type=float, default=95.0)
 
     # --- fno generate sub-command ---
@@ -1339,10 +1339,10 @@ def _make_parser() -> argparse.ArgumentParser:
     fno_gen_sub.add_argument("--resolution",    type=int,   default=64,
                          help="FD grid resolution n×n (default: 64)")
     fno_gen_sub.add_argument("--seed",          type=int,   default=42)
-    fno_gen_sub.add_argument("--dataset-path",  type=str,   default="pretrained_models/fno_train_data.npz")
+    fno_gen_sub.add_argument("--dataset-path",  type=str,   default="pretrained_models/train_data")
     fno_gen_sub.add_argument("--n-val",         type=int,   default=64)
-    fno_gen_sub.add_argument("--val-dataset-path", type=str, default="pretrained_models/fno_val_data.npz")
-    fno_gen_sub.add_argument("--manifest-path", type=str,   default="pretrained_models/fno_manifest.npz")
+    fno_gen_sub.add_argument("--val-dataset-path", type=str, default="pretrained_models/val_data")
+    fno_gen_sub.add_argument("--manifest-path", type=str,   default="pretrained_models/manifest.npz")
     fno_gen_sub.add_argument("--max-iterations", type=int,  default=5000)
     fno_gen_sub.add_argument("--tolerance",      type=float, default=1e-5)
     fno_gen_sub.add_argument("--print-every",    type=int,   default=200)
@@ -1385,12 +1385,12 @@ def _make_parser() -> argparse.ArgumentParser:
     fno_sub.add_argument("--lam-phys",      type=float, default=1.0)
     fno_sub.add_argument("--lam-bc",        type=float, default=10.0)
     fno_sub.add_argument("--seed",          type=int,   default=42)
-    fno_sub.add_argument("--dataset-path",  type=str,   default="pretrained_models/fno_train_data.npz")
-    fno_sub.add_argument("--val-dataset-path", type=str, default="pretrained_models/fno_val_data.npz")
+    fno_sub.add_argument("--dataset-path",  type=str,   default="pretrained_models/train_data")
+    fno_sub.add_argument("--val-dataset-path", type=str, default="pretrained_models/val_data")
     fno_sub.add_argument("--max-iterations", type=int, default=5000)
     fno_sub.add_argument("--tolerance", type=float, default=1e-5)
     fno_sub.add_argument("--fno-path",      type=str,   default="pretrained_models/fno.pt")
-    fno_sub.add_argument("--manifest-path", type=str,   default="pretrained_models/fno_manifest.npz")
+    fno_sub.add_argument("--manifest-path", type=str,   default="pretrained_models/manifest.npz")
     fno_sub.add_argument("--device",        type=str,   default=None)
     fno_sub.add_argument("--print-every",   type=int,   default=200)
     fno_sub.add_argument("--n-val",         type=int,   default=64,

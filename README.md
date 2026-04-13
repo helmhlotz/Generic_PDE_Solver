@@ -18,7 +18,7 @@ The key design concern is **orchestration**: how offline training pipelines, run
 │       │  parallel FD solves via ProcessPoolExecutor             │
 │       │  chunk-and-save (fault-tolerant, resumable)             │
 │       ▼                                                         │
-│  fno_train_data.npz   fno_val_data.npz                          │
+│  train_data   val_data                          │
 │  [inputs(N,64,64,7)   targets(N,64,64)   feats(N,25)]           │
 │       │                                                         │
 │       ├──► FNOTrainer ──► fno.pt + fno_best.pt                  │
@@ -31,7 +31,7 @@ The key design concern is **orchestration**: how offline training pipelines, run
 │       │   Both trainers share _DatasetTrainerBase               │
 │       │   (PDEOperatorDataset + DataLoader, auto 80/20 split)   │
 │       │                                                         │
-│       └──► OODDetector.build_manifest ──► fno_manifest.npz      │
+│       └──► OODDetector.build_manifest ──► manifest.npz          │
 │              KNN threshold: 95th-percentile LOO distance        │
 └─────────────────────────────────────────────────────────────────┘
 
@@ -48,17 +48,17 @@ The key design concern is **orchestration**: how offline training pipelines, run
 │       │                                                         │
 │       ├── "fno"                                                 │
 │       │    │  model file missing?                               │
-│       │    ├── No  ──► OODDetector.check()                      │
-│       │    │              │ in-dist? ──► _fast_path (FNO2DModel) │
-│       │    │              │ OOD?     ──► _fd_path + is_ood=True  │
-│       │    └── Yes ──► _fno_online_path (ConditionalFNO2D)      │
-│       │                   optional warm-start from fno.pt       │
+│       │    ├── Yes ──► _fno_online_path (ConditionalFNO2D)      │
+│       │    └── No  ──► _maybe_ood_fd_fallback()                 │
+│       │                   │ in-dist? ──► _fno_path (offline)   │
+│       │                   │ OOD?     ──► _fd_path + is_ood=True │
 │       │                                                         │
 │       ├── "pinn"                                                │
-│       │    │  model file + _pinn_net loaded?                    │
-│       │    ├── Yes ──► _pinn_path (single forward pass)         │
-│       │    └── No  ──► _pinn_online_path (SharedConditionalPINN2D)│
-│       │                   optional warm-start from pinn.pt      │
+│       │    │  model file / model object missing?                │
+│       │    ├── Yes ──► _pinn_online_path (ConditionalPINN2D)│
+│       │    └── No  ──► _maybe_ood_fd_fallback()                 │
+│       │                   │ in-dist? ──► _pinn_path (offline)   │
+│       │                   │ OOD?     ──► _fd_path + is_ood=True │
 │       │                                                         │
 │       └── "fd"  ──► _fd_path (_FDSolver, Jacobi relaxation)    │
 │                                                                 │
@@ -85,7 +85,7 @@ src/
 ├── launcher.py               PyInstaller-compatible entry point
 ├── trainer.py                CLI + API for data generation and training;
 │                              _DatasetTrainerBase shared loader abstraction for FNO + PINN
-├── inference_engine.py       Runtime routing engine; all solve() paths
+├── inference_engine.py       Runtime routing engine; mirrored FNO/PINN solve skeleton
 ├── evaluate.py               Standalone FD-guardrail evaluation script
 ├── pde_parser.py             Sympy-based PDE and BC string parser
 ├── pde_space.py              PDESpaceConfig, LHSSampler, BCGenerator
@@ -95,7 +95,7 @@ src/
 │   ├── fno_model.py          FNO2DModel (channel-last, 7-ch input)
 │   ├── fno_layers.py         FNOBlock, SpectralConv2d, GridEmbedding2D
 │   ├── conditional_inputs.py ConditionalGrid2D — builds 7-channel input tensor
-│   ├── conditional_solvers.py ConditionalFNO2D, SharedConditionalPINN2D,
+│   ├── conditional_solvers.py ConditionalFNO2D, ConditionalPINN2D,
 │   │                          _PointwiseConditionalPINNNet
 │   └── checkpoints.py        load_model_weights, read_checkpoint_arch
 │
@@ -106,9 +106,9 @@ src/
 pretrained_models/
 ├── fno.pt                    Final FNO weights
 ├── fno_best.pt               Best-val-loss FNO checkpoint
-├── fno_manifest.npz          OOD manifest (features_norm, threshold)
-├── fno_train_data.npz        Training dataset
-└── fno_val_data.npz          Validation dataset
+├── manifest.npz              Shared OOD manifest (features_norm, threshold)
+├── train_data        Training dataset
+└── val_data          Validation dataset
 ```
 
 ---
@@ -124,7 +124,7 @@ On re-run, existing chunks are loaded and skipped — the pipeline is safe to in
 ```
 python src/trainer.py generate \
     --samples 5000 \
-    --dataset-path pretrained_models/fno_train_data.npz \
+    --dataset-path pretrained_models/train_data \
     --n-workers 8          # default: cpu_count()
 ```
 
@@ -137,28 +137,28 @@ Both `FNOTrainer` and `PINNTrainer` inherit `_DatasetTrainerBase`, which provide
 ```bash
 # Stage 1 — generate once, reuse many times
 python src/trainer.py generate --samples 5000 \
-    --dataset-path pretrained_models/fno_train_data.npz
+    --dataset-path pretrained_models/train_data
 
 # Stage 2a — train FNO (supervised + physics + BC hybrid loss)
 python src/trainer.py train --solver fno \
-    --train-dataset pretrained_models/fno_train_data.npz \
-    --val-dataset   pretrained_models/fno_val_data.npz \
+    --train-dataset pretrained_models/train_data \
+    --val-dataset   pretrained_models/val_data \
     --epochs 30
 
 # Stage 2b — train shared PINN on same dataset
 python src/trainer.py train --solver pinn \
-    --train-dataset pretrained_models/fno_train_data.npz \
+    --train-dataset pretrained_models/train_data \
     --epochs 20 --lam-data 1.0
 
 # Stage 3 — build OOD manifest as an explicit step
 python src/trainer.py manifest \
-    --train-dataset pretrained_models/fno_train_data.npz \
-    --val-dataset pretrained_models/fno_val_data.npz \
-    --out pretrained_models/fno_manifest.npz
+    --train-dataset pretrained_models/train_data \
+    --val-dataset pretrained_models/val_data \
+    --out pretrained_models/manifest.npz
 
 # Stage 4 — evaluate checkpoints
 python src/trainer.py test --solver fno \
-    --test-dataset pretrained_models/fno_val_data.npz \
+    --test-dataset pretrained_models/val_data \
     --checkpoint pretrained_models/fno.pt
 
 # One-shot pipeline (generate + train in one command)
@@ -177,20 +177,21 @@ python src/trainer.py fno --samples 5000 --epochs 30
 
 ### 3. Inference routing
 
-`InferenceEngine.solve()` is the single entry point regardless of backend. It applies a deterministic routing decision before any model runs:
+`InferenceEngine.solve()` is the single entry point regardless of backend. FNO and PINN now follow the same routing skeleton: model-availability check → shared OOD gate (`_maybe_ood_fd_fallback`) → offline fast path (if available) or online training path.
 
 | Condition | Route |
 |---|---|
-| `solver_type="fno"`, weights exist, query in-distribution | Single FNO forward pass (`_fast_path`) |
+| `solver_type="fno"`, weights exist, query in-distribution | Offline forward pass (`_fno_path`) |
 | `solver_type="fno"`, weights exist, OOD detected | Jacobi FD fallback; `result.is_ood=True` |
 | `solver_type="fno"`, weights missing | Online FNO training, optional warm-start |
-| `solver_type="pinn"`, `_pinn_net` loaded | Single PINN forward pass (`_pinn_path`) |
-| `solver_type="pinn"`, net not loaded | Online PINN training, optional warm-start |
+| `solver_type="pinn"`, weights/model loaded, query in-distribution | Offline forward pass (`_pinn_path`) |
+| `solver_type="pinn"`, weights/model loaded, OOD detected | Jacobi FD fallback; `result.is_ood=True` |
+| `solver_type="pinn"`, weights/model missing | Online PINN training |
 | `solver_type="fd"` | Jacobi FD always |
 
 ### 4. OOD detection
 
-`OODDetector` gates every FNO query. At training time, `PDEFeaturizer.featurize()` converts each `(ParsedPDE, bc_specs)` pair to a 25-dimensional vector encoding PDE coefficients, RHS statistics, and per-wall BC parameters. `OODDetector.build_manifest()` stores the normalised training features and the 95th-percentile leave-one-out KNN distance as the threshold.
+`OODDetector` can gate both FNO and PINN queries when a manifest is configured. At training time, `PDEFeaturizer.featurize()` converts each `(ParsedPDE, bc_specs)` pair to a 25-dimensional vector encoding PDE coefficients, RHS statistics, and per-wall BC parameters. `OODDetector.build_manifest()` stores the normalised training features and the 95th-percentile leave-one-out KNN distance as the threshold.
 
 At inference time, three checks run in order:
 1. **Structural**: time-dependent or hyperbolic PDE → OOD immediately
@@ -226,7 +227,7 @@ Note: channel 4 is not a numerically estimated normal-flux field. In the current
 | Metadata envelope `{"arch": "shared_pinn", "state_dict": {...}}` | `PINNTrainer` saves | Unwrapped before `load_state_dict` |
 | TorchScript archive (ZIP) | `ConditionalFNO2D.export_torchscript()` | `torch.jit.load`; `skip_if_torchscript=True` available for warm-start bypass |
 
-`read_checkpoint_arch()` inspects the `arch` key without loading weights, allowing routing decisions (e.g. `SharedConditionalPINN2D` vs `ConditionalPINN2D`) without a full model instantiation.
+`read_checkpoint_arch()` inspects the `arch` key without loading weights, allowing routing decisions (e.g. `ConditionalPINN2D` vs `ConditionalPINN2D`) without a full model instantiation.
 
 ---
 
@@ -248,17 +249,17 @@ The sidebar exposes solver selection, weight paths, architecture hyperparameters
 ```bash
 # Evaluate a trained FNO
 python src/evaluate.py fno \
-    --dataset pretrained_models/fno_val_data.npz \
+    --dataset pretrained_models/val_data \
     --model   pretrained_models/fno.pt
 
 # Evaluate a trained shared PINN
 python src/evaluate.py pinn \
-    --dataset pretrained_models/fno_val_data.npz \
+    --dataset pretrained_models/val_data \
     --model   pretrained_models/pinn.pt
 
 # Sanity check: FD against itself (should give ~zero error)
 python src/evaluate.py fd \
-    --dataset pretrained_models/fno_val_data.npz
+    --dataset pretrained_models/val_data
 ```
 
 Metrics: relative L2 error, RMSE, max absolute error, BC satisfaction, PDE residual — reported as mean / std / p50 / p90 / max.
@@ -282,7 +283,7 @@ Python 3.10–3.12. Install with `pip install -e .` from the repo root.
 ## Roadmap
 
 ### Performance (partially done)
-- [ ] **PINN epoch callback → `st.progress()`** — Add `on_epoch` callback to `_pinn_online_path` and `SharedConditionalPINN2D.fit()`; wire to a Streamlit progress bar in `app.py`. Removes the silent spinner during 30–300 s online training.
+- [ ] **PINN epoch callback → `st.progress()`** — Add `on_epoch` callback to `_pinn_online_path` and `ConditionalPINN2D.fit()`; wire to a Streamlit progress bar in `app.py`. Removes the silent spinner during 30–300 s online training.
 - [ ] **Pre-evaluate BC arrays before Jacobi loop** — `GeneralPDE.apply_boundary_conditions` calls sympy lambdas 5000 × 4 walls per solve. Pre-compute all four boundary value tensors once outside the loop and pass them in. ~30 lines across `pde_helpers.py` and `inference_engine.py`.
 - [x] **Structured `logging`** — All progress output in `trainer.py` now uses `logging.getLogger(__name__)` (INFO/WARNING level) in place of `print()`. Formatted summary tables (`_print_test_summary`, `_print_smoke_summary`) remain as `print()` for human-readable terminal output.
 

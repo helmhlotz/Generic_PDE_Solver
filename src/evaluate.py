@@ -9,18 +9,18 @@ Usage (CLI)
 -----------
     # Evaluate FNO on a held-out test dataset
     python src/evaluate.py fno \\
-        --dataset pretrained_models/fno_val_data.npz \\
+        --dataset pretrained_models/val_data \\
         --model   pretrained_models/fno.pt \\
         --width 32 --modes 12 --layers 4
 
     # Evaluate PINN on a held-out test dataset
     python src/evaluate.py pinn \\
-        --dataset pretrained_models/fno_val_data.npz \\
+        --dataset pretrained_models/val_data \\
         --model   pretrained_models/pinn.pt
 
     # Evaluate FD solver only (sanity-check: should give near-zero error)
     python src/evaluate.py fd \\
-        --dataset pretrained_models/fno_val_data.npz
+        --dataset pretrained_models/val_data
 
 Metrics reported
 ----------------
@@ -268,7 +268,7 @@ def _make_parser() -> argparse.ArgumentParser:
     def _add_shared(p: argparse.ArgumentParser) -> None:
         p.add_argument(
             "--dataset", required=True,
-            help="Path to .npz dataset (e.g. pretrained_models/fno_val_data.npz)",
+            help="Path to .npz dataset (e.g. pretrained_models/val_data)",
         )
         p.add_argument("--n-samples",   type=int,   default=None,
                        help="Limit to first N samples (default: all)")
@@ -313,10 +313,7 @@ def _auto_manifest(model_path: str, explicit: str | None) -> str | None:
     if explicit is not None:
         return explicit
     p = Path(model_path)
-    candidates = [
-        p.parent / "fno_manifest.npz",
-        p.with_name(p.stem + "_manifest.npz"),
-    ]
+    candidates = [p.parent / "manifest.npz"]
     for c in candidates:
         if c.exists():
             return str(c)

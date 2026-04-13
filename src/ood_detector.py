@@ -16,7 +16,7 @@ Public API
 
     # At training time (called by trainer.py):
     features = [PDEFeaturizer.featurize(p, bc) for p, bc in training_set]
-    OODDetector.build_manifest(np.stack(features), "pretrained_models/fno_manifest.npz")
+    OODDetector.build_manifest(np.stack(features), "pretrained_models/manifest.npz")
 """
 
 from __future__ import annotations

@@ -8,7 +8,7 @@ Public API
         solver_type="fno",
         fno=FNOConfig(
             model_path="pretrained_models/fno.pt",
-            manifest_path="pretrained_models/fno_manifest.npz",
+            manifest_path="pretrained_models/manifest.npz",
         ),
     )
     engine = InferenceEngine(solver_option=option)
@@ -37,11 +37,11 @@ FD path  (solver_type="fd" or no FNO model available)
     Finite difference iterative solver using Jacobi relaxation.
 
 PINN path  (solver_type="pinn")
-    Trains a SharedConditionalPINN2D (optional warm-start from a state-dict).
+    Trains a ConditionalPINN2D (optional warm-start from a state-dict).
 
 Offline training
 ----------------
-    Use ``src/trainer.py`` to build ``fno.pt`` and ``fno_manifest.npz``:
+    Use ``src/trainer.py`` to build ``fno.pt`` and ``manifest.npz``:
         python src/trainer.py fno --samples 2000 --epochs 30
         python src/trainer.py pinn --samples 200 --steps-per-problem 3 --n-epochs 20
 """
@@ -65,7 +65,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from models.checkpoints import load_model_weights, read_checkpoint_arch
 from models.conditional_inputs import ConditionalGrid2D
-from models.conditional_solvers import ConditionalFNO2D, SharedConditionalPINN2D, _PointwiseConditionalPINNNet
+from models.conditional_solvers import ConditionalFNO2D, ConditionalPINN2D, _PointwiseConditionalPINNNet
 from models.fno_model import FNO2DModel
 from ood_detector import OODDetector
 from pde_parser import ParsedPDE, parse_bc, parse_pde
@@ -102,13 +102,13 @@ class FNOConfig:
     lambda_bc: float = 10.0
     print_every: int = 500
     # Path to the OOD manifest built by trainer.py; None disables OOD checking.
-    manifest_path: str | None = None
+    manifest_path: str | None = "pretrained_models/manifest.npz"
 
 
 @dataclass
 class PINNConfig:
     model_path: str | None = None
-    manifest_path: str | None = None
+    manifest_path: str | None = "pretrained_models/manifest.npz"
     hidden: int = 64
     n_layers: int = 4
     epochs: int = 1000          # Adam warm-up steps (L-BFGS handles final convergence)
@@ -524,24 +524,32 @@ class InferenceEngine:
                     print_every=print_every_eff,
                     pretrained_path=fno_cfg.model_path,
                 )
-            # OOD gate: check before running the FNO forward pass
-            if self._ood_detector is not None:
-                is_ood, ood_reason = self._ood_detector.check(parsed_pde, bc_specs)
-                if is_ood:
-                    print(f"OOD detected ({ood_reason}); falling back to FD solver.")
-                    fd_result = self._fd_path(
-                        pde_obj, n_points_eff, print_every_eff,
-                        max_iterations=fd_cfg.max_iterations,
-                        tolerance=fd_cfg.tolerance,
-                    )
-                    fd_result.is_ood    = True
-                    fd_result.ood_reason = ood_reason
-                    fd_result.method    = "fd_fallback"
-                    return fd_result
+            fd_fallback = self._maybe_ood_fd_fallback(
+                parsed_pde=parsed_pde,
+                bc_specs=bc_specs,
+                pde_obj=pde_obj,
+                n_points=n_points_eff,
+                print_every=print_every_eff,
+            )
+            if fd_fallback is not None:
+                return fd_fallback
 
             if self._jit_model is not None:
                 return self._jit_path(parsed_pde, bc_specs, pde_obj, source_fn, n_points_eff)
-            return self._fast_path(parsed_pde, bc_specs, pde_obj, source_fn, n_points_eff)
+            if self._model is None:
+                print("FNO model not loaded; using online FNO training...")
+                return self._fno_online_path(
+                    parsed_pde, bc_specs, pde_obj, source_fn, n_points_eff,
+                    lam_phys=lam_phys_eff, lam_bc=lam_bc_eff,
+                    n_epochs=fno_epochs_eff, lr=fno_lr_eff,
+                    print_every=print_every_eff,
+                    pretrained_path=fno_cfg.model_path,
+                )
+            print("Using FNO solver (offline)...")
+            return self._fno_path(
+                pde_obj=pde_obj,
+                n_points=n_points_eff,
+            )
 
         if solver_type == "pinn":
             # File existence check: if no model file, use online PINN training
@@ -558,31 +566,32 @@ class InferenceEngine:
                     n_lbfgs_steps=pinn_cfg.n_lbfgs_steps,
                     early_stop_tol=pinn_cfg.early_stop_tol,
                 )
-            # OOD gate: check before offline PINN inference
-            if self._ood_detector is not None:
-                is_ood, ood_reason = self._ood_detector.check(parsed_pde, bc_specs)
-                if is_ood:
-                    print(f"OOD detected ({ood_reason}); falling back to FD solver.")
-                    fd_result = self._fd_path(
-                        pde_obj, n_points_eff, print_every_eff,
-                        max_iterations=fd_cfg.max_iterations,
-                        tolerance=fd_cfg.tolerance,
-                    )
-                    fd_result.is_ood    = True
-                    fd_result.ood_reason = ood_reason
-                    fd_result.method    = "fd_fallback"
-                    return fd_result
+            fd_fallback = self._maybe_ood_fd_fallback(
+                parsed_pde=parsed_pde,
+                bc_specs=bc_specs,
+                pde_obj=pde_obj,
+                n_points=n_points_eff,
+                print_every=print_every_eff,
+            )
+            if fd_fallback is not None:
+                return fd_fallback
+            if self._pinn_net is None:
+                print("PINN model not loaded; using online PINN training...")
+                return self._pinn_online_path(
+                    pde_obj=pde_obj,
+                    n_points=n_points_eff,
+                    n_epochs=pinn_epochs_eff,
+                    lr=pinn_lr_eff,
+                    lam_phys=lam_phys_eff,
+                    lam_bc=lam_bc_eff,
+                    print_every=print_every_eff,
+                    n_lbfgs_steps=pinn_cfg.n_lbfgs_steps,
+                    early_stop_tol=pinn_cfg.early_stop_tol,
+                )
             print("Using PINN solver (offline)...")
             return self._pinn_path(
                 pde_obj=pde_obj,
                 n_points=n_points_eff,
-                n_epochs=pinn_epochs_eff,
-                lr=pinn_lr_eff,
-                lam_phys=lam_phys_eff,
-                lam_bc=lam_bc_eff,
-                print_every=print_every_eff,
-                n_lbfgs_steps=pinn_cfg.n_lbfgs_steps,
-                early_stop_tol=pinn_cfg.early_stop_tol,
             )
 
         print("Using finite difference solver...")
@@ -637,28 +646,99 @@ class InferenceEngine:
             method="torchscript",
         )
 
-    # ------------------------------------------------------------------
-    def _fast_path(
+    def _maybe_ood_fd_fallback(
         self,
+        *,
         parsed_pde: ParsedPDE,
         bc_specs: dict,
         pde_obj: GeneralPDE,
-        source_fn,
+        n_points: int,
+        print_every: int,
+    ) -> SolveResult | None:
+        """Return FD fallback result when query is OOD, otherwise None."""
+        if self._ood_detector is None:
+            return None
+        is_ood, ood_reason = self._ood_detector.check(parsed_pde, bc_specs)
+        if not is_ood:
+            return None
+        print(f"OOD detected ({ood_reason}); falling back to FD solver.")
+        fd_result = self._fd_path(
+            pde_obj,
+            n_points,
+            print_every,
+            max_iterations=self.options.fd.max_iterations,
+            tolerance=self.options.fd.tolerance,
+        )
+        fd_result.is_ood = True
+        fd_result.ood_reason = ood_reason
+        fd_result.method = "fd_fallback"
+        return fd_result
+
+    def _offline_grid_path(
+        self,
+        *,
+        model: nn.Module,
+        pde_obj: GeneralPDE,
+        n_points: int,
+        method: str,
+    ) -> SolveResult:
+        """Run a preloaded operator model on the 7-channel conditional grid."""
+        source_fn = pde_obj.parsed_pde.rhs_fn()
+        grid = ConditionalGrid2D(n_points, pde_obj.bc_specs, source_fn, self.device)
+        model.eval()
+        with torch.no_grad():
+            u = model(grid.input_grid).squeeze(0).squeeze(-1)
+        residual = float(pde_obj.compute_pde_loss(u).item())
+        bc_err = float(pde_obj.compute_bc_loss(u, grid.x_1d, grid.y_1d).item())
+        return SolveResult(
+            u=u.cpu().numpy(),
+            xx=grid.xx.cpu().numpy(),
+            yy=grid.yy.cpu().numpy(),
+            residual=residual,
+            bc_error=bc_err,
+            method=method,
+        )
+
+    def _online_eval_to_result(
+        self,
+        *,
+        pde_obj: GeneralPDE,
+        eval_out: dict[str, torch.Tensor],
+        n_points: int,
+        method: str,
+        history: list[float],
+    ) -> SolveResult:
+        """Convert online model evaluate() output into a SolveResult."""
+        u = eval_out["u"].to(self.device)
+        xx = eval_out["xx"].to(self.device)
+        yy = eval_out["yy"].to(self.device)
+        x_1d = torch.linspace(0, 1, n_points, device=self.device)
+        y_1d = torch.linspace(0, 1, n_points, device=self.device)
+        residual = float(pde_obj.compute_pde_loss(u).item())
+        bc_err = float(pde_obj.compute_bc_loss(u, x_1d, y_1d).item())
+        return SolveResult(
+            u=u.cpu().numpy(),
+            xx=xx.cpu().numpy(),
+            yy=yy.cpu().numpy(),
+            residual=residual,
+            bc_error=bc_err,
+            method=method,
+            history=history,
+        )
+
+    # ------------------------------------------------------------------
+    def _fno_path(
+        self,
+        pde_obj: GeneralPDE,
         n_points: int,
     ) -> SolveResult:
-        solver = _FNOSolver(
+        if self._model is None:
+            raise RuntimeError("FNO model is not loaded for offline inference.")
+        return self._offline_grid_path(
             model=self._model,
-            width=self.width,
-            n_modes=self.n_modes,
-            n_layers=self.n_layers,
-            device=self.device,
-        )
-        return solver.solve(
-            parsed_pde=parsed_pde,
-            bc_specs=bc_specs,
             pde_obj=pde_obj,
-            source_fn=source_fn,
             n_points=n_points,
+            method="fno",
         )
 
     # ------------------------------------------------------------------
@@ -693,20 +773,11 @@ class InferenceEngine:
         )
         model.train(n_epochs=n_epochs, print_every=print_every)
         eval_out = model.evaluate(n_eval=n_points, t=0.0)
-        u       = eval_out["u"].to(self.device)
-        xx      = eval_out["xx"].to(self.device)
-        yy      = eval_out["yy"].to(self.device)
         history = model.history.get("total", [])
-        x_1d = torch.linspace(0, 1, n_points, device=self.device)
-        y_1d = torch.linspace(0, 1, n_points, device=self.device)
-        residual = float(pde_obj.compute_pde_loss(u).item())
-        bc_err   = float(pde_obj.compute_bc_loss(u, x_1d, y_1d).item())
-        return SolveResult(
-            u=u.cpu().numpy(),
-            xx=xx.cpu().numpy(),
-            yy=yy.cpu().numpy(),
-            residual=residual,
-            bc_error=bc_err,
+        return self._online_eval_to_result(
+            pde_obj=pde_obj,
+            eval_out=eval_out,
+            n_points=n_points,
             method="fno",
             history=history,
         )
@@ -751,43 +822,14 @@ class InferenceEngine:
         self,
         pde_obj: GeneralPDE,
         n_points: int,
-        n_epochs: int,
-        lr: float,
-        lam_phys: float,
-        lam_bc: float,
-        print_every: int,
-        n_lbfgs_steps: int = 200,
-        early_stop_tol: float = 1e-6,
     ) -> SolveResult:
-        # Offline fast path: single forward pass through pre-loaded PINN weights
-        if self._pinn_net is not None:
-            source_fn = pde_obj.parsed_pde.rhs_fn()
-            grid = ConditionalGrid2D(n_points, pde_obj.bc_specs, source_fn, self.device)
-            self._pinn_net.eval()
-            with torch.no_grad():
-                u = self._pinn_net(grid.input_grid).squeeze(0).squeeze(-1)
-            residual = float(pde_obj.compute_pde_loss(u).item())
-            bc_err   = float(pde_obj.compute_bc_loss(u, grid.x_1d, grid.y_1d).item())
-            return SolveResult(
-                u=u.cpu().numpy(),
-                xx=grid.xx.cpu().numpy(),
-                yy=grid.yy.cpu().numpy(),
-                residual=residual,
-                bc_error=bc_err,
-                method="pinn",
-            )
-        # _pinn_net is None (load failed or was suppressed); fall through to online training.
-        print("PINN net not loaded; falling back to online PINN training...")
-        return self._pinn_online_path(
+        if self._pinn_net is None:
+            raise RuntimeError("PINN model is not loaded for offline inference.")
+        return self._offline_grid_path(
+            model=self._pinn_net,
             pde_obj=pde_obj,
             n_points=n_points,
-            n_epochs=n_epochs,
-            lr=lr,
-            lam_phys=lam_phys,
-            lam_bc=lam_bc,
-            print_every=print_every,
-            n_lbfgs_steps=n_lbfgs_steps,
-            early_stop_tol=early_stop_tol,
+            method="pinn",
         )
 
     # ------------------------------------------------------------------
@@ -804,7 +846,7 @@ class InferenceEngine:
         early_stop_tol: float = 1e-6,
     ) -> SolveResult:
         """Per-problem online PINN training when no pre-trained weights are available."""
-        model = SharedConditionalPINN2D(
+        model = ConditionalPINN2D(
             parsed_pde=pde_obj.parsed_pde,
             bc_specs=pde_obj.bc_specs,
             ic_specs=pde_obj.ic_specs,
@@ -824,22 +866,11 @@ class InferenceEngine:
             early_stop_tol=early_stop_tol,
         )
         eval_out = model.evaluate(n_eval=n_points, t=0.0)
-        u       = eval_out["u"].to(self.device)
-        xx      = eval_out["xx"].to(self.device)
-        yy      = eval_out["yy"].to(self.device)
         history = model.history.get("total", [])
-
-        x_1d = torch.linspace(0, 1, n_points, device=self.device)
-        y_1d = torch.linspace(0, 1, n_points, device=self.device)
-        residual = float(pde_obj.compute_pde_loss(u).item())
-        bc_err   = float(pde_obj.compute_bc_loss(u, x_1d, y_1d).item())
-
-        return SolveResult(
-            u=u.cpu().numpy(),
-            xx=xx.cpu().numpy(),
-            yy=yy.cpu().numpy(),
-            residual=residual,
-            bc_error=bc_err,
+        return self._online_eval_to_result(
+            pde_obj=pde_obj,
+            eval_out=eval_out,
+            n_points=n_points,
             method="pinn",
             history=history,
         )

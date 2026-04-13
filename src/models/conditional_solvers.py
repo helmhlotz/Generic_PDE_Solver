@@ -181,7 +181,7 @@ class _PointwiseConditionalPINNNet(nn.Module):
         return out.reshape(batch, nx, ny, 1)
 
 
-class SharedConditionalPINN2D(NeuralPDEModel):
+class ConditionalPINN2D(NeuralPDEModel):
     """Shared-weights conditional PINN trained across many PDE problems."""
 
     def __init__(
@@ -637,6 +637,6 @@ __all__ = [
     "ConditionalFNO2D",
     "ConditionalPINN2D",
     "NeuralPDEModel",
-    "SharedConditionalPINN2D",
+    "ConditionalPINN2D",
     "_PointwiseConditionalPINNNet",
 ]

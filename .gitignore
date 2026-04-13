@@ -20,9 +20,15 @@ dist/
 *.egg-info/
 
 # Local training artifacts
-pretrained_models/fno_train_data.npz
-pretrained_models/fno_val_data.npz
+pretrained_models/train_data
+pretrained_models/val_data
 pretrained_models/fno_train_data_chunk_*.npz
 pretrained_models/datasets/
 
 files*
+diff.md
+Full codebase exploration.md
+SKILL.md
+pretrained_models/fno_val_data_chunk_000000.npz
+pretrained_models/fno.ckpt
+src/trainer_new.py

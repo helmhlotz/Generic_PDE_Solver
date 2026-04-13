@@ -50,21 +50,19 @@ st.caption(
 )
 # ---------------------------------------------------------------------------
 
-def _derive_manifest_path(model_path: str, solver_tag: str = "fno") -> str | None:
-    """Return an OOD manifest path for a model path, or None if absent.
+def _derive_manifest_path(model_path: str | None) -> str:
+    """Return the shared OOD manifest path (no legacy fallback)."""
+    shared_default = Path("pretrained_models/manifest.npz")
+    if shared_default.exists():
+        return str(shared_default)
 
-    Looks for ``<model_dir>/<solver_tag>_manifest.npz`` first, then tries
-    ``<model_stem>_manifest.npz``.
-    """
-    p = Path(model_path)
-    candidates = [
-        p.parent / f"{solver_tag}_manifest.npz",
-        p.with_name(p.stem + "_manifest.npz"),
-    ]
+    candidates: list[Path] = []
+    if model_path is not None:
+        candidates.append(Path(model_path).parent / "manifest.npz")
     for c in candidates:
         if c.exists():
             return str(c)
-    return None
+    return str(shared_default)
 
 # ---------------------------------------------------------------------------
 _DEFAULT_PDE  = "u_xx + u_yy = 0"
@@ -90,30 +88,26 @@ with st.sidebar:
 
     use_pretrained = st.toggle("Use pretrained model", value=True)
     solver_type = st.radio("Solver type", ["FNO", "PINN", "FD"], horizontal=True)
+    fno_path: str | None = None
+    pinn_path: str | None = None
 
     if solver_type == "FD":
-        fno_path = ""
-        pinn_path = ""
         st.warning("FD solver selected: the app will skip FNO/PINN and use finite difference.")
     elif use_pretrained:
         if solver_type == "FNO":
-            fno_path = st.text_input(
+            fno_path_val = st.text_input(
                 "FNO weights path",
                 value="pretrained_models/fno.pt",
                 help="State-dict (.pt) or TorchScript archive for the conditional FNO.",
             )
-            pinn_path = ""
+            fno_path = fno_path_val.strip() or None
         else:
-            pinn_path = st.text_input(
+            pinn_path_val = st.text_input(
                 "PINN weights path",
                 value="pretrained_models/pinn.pt",
-                help="State-dict (.pt) of the pretrained MLP PINN. "
-                     "Used as warm-start before further training.",
+                help="State-dict (.pt) of the pretrained MLP PINN for offline inference.",
             )
-            fno_path = ""
-    else:
-        fno_path = ""
-        pinn_path = ""
+            pinn_path = pinn_path_val.strip() or None
 
     with st.expander("FD / Fallback configuration", expanded=False):
         fd_max_iterations = st.number_input(
@@ -171,7 +165,7 @@ with st.sidebar:
     fno_online_lr = 1e-3
 
     if solver_type == "FNO":
-        if use_pretrained and fno_path:
+        if use_pretrained:
             st.info("Training controls are disabled while using a pretrained FNO.")
         else:
             fno_online_epochs = st.number_input(
@@ -186,7 +180,7 @@ with st.sidebar:
             )
         pinn_epochs = 3000
     elif solver_type == "PINN":
-        if use_pretrained and pinn_path:
+        if use_pretrained:
             pinn_epochs = 3000  # offline forward pass — no training loop runs
             st.info("Training epochs not applicable when using a pretrained PINN (offline forward pass).")
         else:
@@ -294,8 +288,8 @@ if st.button("Solve", type="primary", disabled=solve_disabled, use_container_wid
                         print_every=int(fd_print_every),
                     ),
                     fno=FNOConfig(
-                        model_path=fno_path if (use_pretrained and fno_path) else None,
-                        manifest_path=_derive_manifest_path(fno_path) if (use_pretrained and fno_path) else None,
+                        model_path=fno_path if use_pretrained else None,
+                        manifest_path=_derive_manifest_path(fno_path),
                         width=int(fno_width),
                         n_modes=(int(fno_modes), int(fno_modes)),
                         n_layers=int(fno_layers),
@@ -326,8 +320,8 @@ if st.button("Solve", type="primary", disabled=solve_disabled, use_container_wid
                         print_every=int(fd_print_every),
                     ),
                     pinn=PINNConfig(
-                        model_path=pinn_path if (use_pretrained and pinn_path) else None,
-                        manifest_path=_derive_manifest_path(pinn_path, solver_tag="pinn") if (use_pretrained and pinn_path) else None,
+                        model_path=pinn_path if use_pretrained else None,
+                        manifest_path=_derive_manifest_path(pinn_path),
                         hidden=int(pinn_hidden),
                         n_layers=int(pinn_layers_n),
                         epochs=int(pinn_epochs),
@@ -372,7 +366,7 @@ if st.button("Solve", type="primary", disabled=solve_disabled, use_container_wid
             if solver_type == "FNO" and not use_pretrained:
                 solve_kwargs["fno_epochs"] = int(fno_online_epochs)
                 solve_kwargs["fno_lr"] = float(fno_online_lr)
-            if solver_type == "PINN" and not (use_pretrained and pinn_path):
+            if solver_type == "PINN" and not use_pretrained:
                 solve_kwargs["pinn_epochs"] = int(pinn_epochs)
             result = engine.solve(
                 **solve_kwargs,
