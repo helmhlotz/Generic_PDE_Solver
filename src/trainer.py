@@ -1,15 +1,14 @@
-"""Offline training pipeline for conditional FNO / PINN solvers.
+"""Offline training pipeline for conditional FNO / DeepONet solvers.
 
 Public CLI
 ----------
     $ python -m src.trainer generate  …  # FD-supervised dataset generation
-    $ python -m src.trainer train     …  # model training (fno|pinn)
+    $ python -m src.trainer train     …  # model training (fno|deeponet)
     $ python -m src.trainer manifest  …  # OOD manifest creation
     $ python -m src.trainer test      …  # evaluation on a held-out set
 
-Legacy entry-points (``fno-generate``, ``fno-train``, ``fno``, ``pinn``,
-``fno-test``, ``pinn-test``) are kept as thin wrappers for back-compatibility
-but emit a deprecation warning so users can migrate to the unified CLI.
+Legacy entry-points (``fno-generate``, ``fno-train``, ``fno``, ``fno-test``)
+are kept as thin wrappers for back-compatibility.
 """
 
 from __future__ import annotations
@@ -33,9 +32,17 @@ from torch.utils.data import DataLoader, Subset
 # Ensure src/ is in path when invoked directly
 sys.path.insert(0, str(Path(__file__).parent))
 
-from dataset import PDEOperatorDataset, RepeatDataset, collate_operator_batch
+from dataset import (
+    RepeatDataset,
+    collate_operator_batch,
+    collate_supervised_batch,
+    load_dataset_artifact,
+    load_operator_dataset,
+    CANONICAL_DATASET_SCHEMA_VERSION,
+    OperatorMaterializationConfig,
+)
 from models.conditional_inputs import ConditionalGrid2D
-from models.conditional_solvers import _PointwiseConditionalPINNNet
+from models.conditional_solvers import DeepONet2DModel
 from models.fno_model import FNO2DModel
 from pde_space import PDESpaceConfig, LHSSampler
 from ood_detector import PDEFeaturizer, OODDetector
@@ -124,7 +131,7 @@ def _solve_one_worker(args: tuple) -> dict | None:
 # ---------------------------------------------------------------------------
 
 class SharedFDDataGenerator:
-    """Generate shared FD-supervised datasets for both FNO and PINN."""
+    """Generate shared FD-supervised datasets for both FNO and DeepONet."""
 
     GRID_POINTS = 64
 
@@ -212,11 +219,13 @@ class SharedFDDataGenerator:
                 Path(chunk_path).parent.mkdir(parents=True, exist_ok=True)
                 np.savez_compressed(
                     chunk_path,
+                    schema_version=np.array([CANONICAL_DATASET_SCHEMA_VERSION], dtype=np.int32),
                     inputs=c_inputs,
                     targets=c_targets,
                     pde_strs=c_pde_strs,
                     bc_json=c_bc_json,
                     feats=c_feats,
+                    n_points=np.array([self.n_points], dtype=np.int32),
                 )
 
                 inputs.extend(c_inputs)
@@ -234,6 +243,7 @@ class SharedFDDataGenerator:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             save_path,
+            schema_version=np.array([CANONICAL_DATASET_SCHEMA_VERSION], dtype=np.int32),
             inputs=np.stack(inputs),
             targets=np.stack(targets),
             pde_strs=np.array(pde_strs, dtype=object),
@@ -248,13 +258,8 @@ class SharedFDDataGenerator:
 
 def _load_dataset_features(dataset_path: str) -> np.ndarray:
     """Load PDE feature vectors stored in a generated dataset."""
-    data = np.load(dataset_path, allow_pickle=True)
-    if "feats" not in data:
-        raise KeyError(
-            f"Dataset {dataset_path!r} does not contain stored PDE features. "
-            "Re-generate it with the current trainer before building an OOD manifest."
-        )
-    return np.asarray(data["feats"], dtype=np.float32)
+    artifact = load_dataset_artifact(dataset_path)
+    return artifact.feats
 
 
 def build_ood_manifest(
@@ -266,7 +271,7 @@ def build_ood_manifest(
     """Build an OOD manifest from generated dataset features.
 
     Feature vectors are computed from PDE coefficients and BC specs at generation
-    time, so this manifest is valid for both FNO and PINN solvers.
+    time, so this manifest is valid for both FNO and DeepONet solvers.
     """
     train_feats = _load_dataset_features(train_dataset)
     val_feats = _load_dataset_features(val_dataset) if val_dataset is not None else None
@@ -279,13 +284,19 @@ def build_ood_manifest(
     log.info("Saved OOD manifest to %s", out_path)
 
 
-def _make_operator_loader(dataset: torch.utils.data.Dataset, *, shuffle: bool) -> DataLoader:
+def _make_operator_loader(
+    dataset: torch.utils.data.Dataset,
+    *,
+    shuffle: bool,
+    batch_size: int,
+    collate_fn: Callable[[list[dict[str, Any]]], dict[str, Any]],
+) -> DataLoader:
     """Create a standard operator DataLoader with the shared collate fn."""
     return DataLoader(
         dataset,
-        batch_size=1,
+        batch_size=batch_size,
         shuffle=shuffle,
-        collate_fn=collate_operator_batch,
+        collate_fn=collate_fn,
     )
 
 
@@ -373,6 +384,15 @@ class _DatasetTrainerBase:
     def _wrap_state_dict(self, state: dict[str, torch.Tensor]) -> Any:
         return state
 
+    def _train_batch_size(self) -> int:
+        return 1
+
+    def _val_batch_size(self) -> int:
+        return self._train_batch_size()
+
+    def _collate_fn(self) -> Callable[[list[dict[str, Any]]], dict[str, Any]]:
+        return collate_operator_batch
+
     def _build_loaders_from_datasets(
         self,
         *,
@@ -387,12 +407,14 @@ class _DatasetTrainerBase:
         seed: int,
     ) -> tuple[DataLoader, DataLoader | None, int, int, bool]:
         """Build train/val loaders from generated datasets only."""
-        train_ds_base = PDEOperatorDataset(
-            npz_path=train_dataset_path,
-            device=self.device,
-            n_points=n_points,
-            use_targets=use_targets,
-            rebuild_inputs=rebuild_inputs,
+        train_ds_base = load_operator_dataset(
+            train_dataset_path,
+            config=OperatorMaterializationConfig(
+                device=self.device,
+                n_points=n_points,
+                use_targets=use_targets,
+                rebuild_inputs=rebuild_inputs,
+            ),
         )
 
         auto_split = False
@@ -405,12 +427,14 @@ class _DatasetTrainerBase:
             auto_split = val_ds is not None
         else:
             train_ds = train_ds_base
-            val_ds = PDEOperatorDataset(
-                npz_path=val_dataset_path,
-                device=self.device,
-                n_points=n_points,
-                use_targets=use_targets,
-                rebuild_inputs=rebuild_inputs,
+            val_ds = load_operator_dataset(
+                val_dataset_path,
+                config=OperatorMaterializationConfig(
+                    device=self.device,
+                    n_points=n_points,
+                    use_targets=use_targets,
+                    rebuild_inputs=rebuild_inputs,
+                ),
             )
 
         train_len = len(train_ds)
@@ -420,8 +444,22 @@ class _DatasetTrainerBase:
         if steps_per_problem > 1:
             train_for_loader = RepeatDataset(train_ds, steps_per_problem)
 
-        train_loader = _make_operator_loader(train_for_loader, shuffle=shuffle_train)
-        val_loader = _make_operator_loader(val_ds, shuffle=False) if val_ds is not None else None
+        train_loader = _make_operator_loader(
+            train_for_loader,
+            shuffle=shuffle_train,
+            batch_size=self._train_batch_size(),
+            collate_fn=self._collate_fn(),
+        )
+        val_loader = (
+            _make_operator_loader(
+                val_ds,
+                shuffle=False,
+                batch_size=self._val_batch_size(),
+                collate_fn=self._collate_fn(),
+            )
+            if val_ds is not None
+            else None
+        )
         return train_loader, val_loader, train_len, val_len, auto_split
 
     def _load_examples(
@@ -431,12 +469,14 @@ class _DatasetTrainerBase:
         use_targets: bool = True,
         rebuild_inputs: bool = False,
     ) -> list[dict[str, Any]]:
-        dataset = PDEOperatorDataset(
-            npz_path=dataset_path,
-            device=self.device,
-            n_points=self.n_points,
-            use_targets=use_targets,
-            rebuild_inputs=rebuild_inputs,
+        dataset = load_operator_dataset(
+            dataset_path,
+            config=OperatorMaterializationConfig(
+                device=self.device,
+                n_points=self.n_points,
+                use_targets=use_targets,
+                rebuild_inputs=rebuild_inputs,
+            ),
         )
         return dataset.examples
 
@@ -583,14 +623,18 @@ class FNOTrainer(_DatasetTrainerBase):
         n_layers: int = 4,
         lr: float = 5e-4,
         lam_data: float = 1.0,
-        lam_phys: float = 1.0,
-        lam_bc: float = 10.0,
+        lam_phys: float = 0.0,
+        lam_bc: float = 0.0,
+        batch_size: int = 16,
         device: str | None = None,
     ) -> None:
         self.n_points  = n_points
         self.lam_data  = lam_data
         self.lam_phys  = lam_phys
         self.lam_bc    = lam_bc
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        self.batch_size = batch_size
         self.device    = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
         )
@@ -611,7 +655,13 @@ class FNOTrainer(_DatasetTrainerBase):
         return "FNO"
 
     def _checkpoint_label(self) -> str:
-        return "hybrid FNO weights"
+        return "supervised FNO weights"
+
+    def _train_batch_size(self) -> int:
+        return self.batch_size
+
+    def _collate_fn(self) -> Callable[[list[dict[str, Any]]], dict[str, Any]]:
+        return collate_supervised_batch
 
     def _loss_cfg(self) -> dict[str, float]:
         return {
@@ -630,7 +680,7 @@ class FNOTrainer(_DatasetTrainerBase):
         eval_every: int = 1,
         seed: int = 42,
     ) -> None:
-        """Train FNO from generated dataset using hybrid supervision + physics."""
+        """Train FNO from generated dataset using supervised operator loss."""
         self._train_from_dataset(
             train_dataset_path=train_dataset_path,
             val_dataset_path=val_dataset_path,
@@ -639,7 +689,7 @@ class FNOTrainer(_DatasetTrainerBase):
             print_every=print_every,
             eval_every=eval_every,
             seed=seed,
-            train_log_label="hybrid FNO",
+            train_log_label="supervised FNO",
         )
 
     # ------------------------------------------------------------------
@@ -669,49 +719,42 @@ class FNOTrainer(_DatasetTrainerBase):
             summary_label=self._summary_label(),
         )
 
-class PINNTrainer(_DatasetTrainerBase):
-    """Train a shared-weights conditional PINN across LHS-sampled problems.
-
-    This mirrors ``FNOTrainer`` conceptually: a single PINN checkpoint is
-    updated over many PDE instances so it can learn reusable patterns across
-    the sampled PDE family instead of solving each problem from scratch.
-
-    Parameters
-    ----------
-    n_points  : grid resolution
-    hidden    : hidden units per MLP layer
-    n_layers  : number of MLP layers
-    lr        : Adam learning rate
-    lam_phys  : physics-loss weight
-    lam_bc    : BC-loss weight
-    device    : torch device string
-    """
+class DeepONetTrainer(_DatasetTrainerBase):
+    """Train a fixed-resolution DeepONet operator across sampled PDE problems."""
 
     def __init__(
         self,
         n_points: int = 32,
-        hidden: int = 64,
-        n_layers: int = 4,
+        branch_hidden: int = 128,
+        branch_layers: int = 3,
+        trunk_hidden: int = 128,
+        trunk_layers: int = 3,
+        latent_dim: int = 128,
         lr: float = 1e-3,
         lam_data: float = 1.0,
-        lam_phys: float = 1.0,
-        lam_bc: float = 10.0,
+        lam_bc: float = 0.0,
         device: str | None = None,
     ) -> None:
-        self.n_points  = n_points
-        self.hidden    = hidden
-        self.n_layers  = n_layers
-        self.lr        = lr
-        self.lam_data  = lam_data
-        self.lam_phys  = lam_phys
-        self.lam_bc    = lam_bc
-        self.device    = torch.device(
+        self.n_points = n_points
+        self.branch_hidden = branch_hidden
+        self.branch_layers = branch_layers
+        self.trunk_hidden = trunk_hidden
+        self.trunk_layers = trunk_layers
+        self.latent_dim = latent_dim
+        self.lr = lr
+        self.lam_data = lam_data
+        self.lam_bc = lam_bc
+        self.device = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
         )
-        self.model = _PointwiseConditionalPINNNet(
+        self.model = DeepONet2DModel(
+            n_points=self.n_points,
             in_channels=7,
-            hidden=self.hidden,
-            n_layers=self.n_layers,
+            branch_hidden=self.branch_hidden,
+            branch_layers=self.branch_layers,
+            trunk_hidden=self.trunk_hidden,
+            trunk_layers=self.trunk_layers,
+            latent_dim=self.latent_dim,
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         self.scheduler: optim.lr_scheduler.LRScheduler | None = None
@@ -720,38 +763,36 @@ class PINNTrainer(_DatasetTrainerBase):
         return self.model
 
     def _summary_label(self) -> str:
-        return "PINN"
+        return "DeepONet"
 
     def _checkpoint_label(self) -> str:
-        return "shared PINN weights"
+        return "fixed-resolution DeepONet weights"
 
     def _loss_cfg(self) -> dict[str, float]:
         return {
             "lam_data": self.lam_data,
-            "lam_phys": self.lam_phys,
+            "lam_phys": 0.0,
             "lam_bc": self.lam_bc,
         }
 
     def _wrap_state_dict(self, state: dict[str, torch.Tensor]) -> Any:
-        return {"arch": "shared_pinn", "state_dict": state}
+        return {
+            "arch": "deeponet",
+            "n_points": self.n_points,
+            "state_dict": state,
+        }
 
     def train(
         self,
         train_dataset_path: str,
         val_dataset_path: str | None = None,
-        steps_per_problem: int = 3,
         n_epochs: int = 20,
-        save_path: str = "pretrained_models/pinn.pt",
+        save_path: str = "pretrained_models/deeponet.pt",
         seed: int = 42,
         print_every: int = 500,
-        eval_every: int = 1000,
+        eval_every: int = 1,
     ) -> None:
-        """Train shared PINN from generated datasets only."""
-        if steps_per_problem != 1:
-            log.warning(
-                "steps_per_problem=%d is ignored for dataset-driven PINN training; using one pass per example.",
-                steps_per_problem,
-            )
+        """Train DeepONet from generated datasets only."""
         self._train_from_dataset(
             train_dataset_path=train_dataset_path,
             val_dataset_path=val_dataset_path,
@@ -760,7 +801,7 @@ class PINNTrainer(_DatasetTrainerBase):
             print_every=print_every,
             eval_every=eval_every,
             seed=seed,
-            train_log_label="shared PINN",
+            train_log_label="DeepONet",
         )
 
     def test(
@@ -768,20 +809,7 @@ class PINNTrainer(_DatasetTrainerBase):
         test_dataset_path: str,
         print_every: int = 10,
     ) -> dict[str, float]:
-        """Evaluate the trained shared PINN against FD ground truth on a held-out test set.
-
-        Runs the shared net in eval mode on each sample and reports error metrics
-        comparing predictions to the stored FD targets (downsampled to self.n_points).
-
-        Parameters
-        ----------
-        test_dataset_path : Path to .npz test dataset.
-        print_every       : Print per-sample stats every N samples.
-
-        Returns
-        -------
-        summary : dict with aggregate metrics.
-        """
+        """Evaluate the trained DeepONet against FD ground truth on a held-out test set."""
         return self._test_from_dataset(
             test_dataset_path=test_dataset_path,
             print_every=print_every,
@@ -821,16 +849,6 @@ def _print_test_summary(summary: dict[str, float], label: str) -> None:
 # ---------------------------------------------------------------------------
 # PDESpace smoke benchmark (coverage + FD solvability guardrail)
 # ---------------------------------------------------------------------------
-
-def _build_space_config(space_name: str) -> PDESpaceConfig:
-    """Return a PDESpaceConfig preset by name."""
-    key = space_name.strip().lower()
-    if key in ("thermal-v2", "thermal_v2"):
-        return PDESpaceConfig.thermal_v2()
-    if key == "default":
-        return PDESpaceConfig()
-    raise ValueError(f"Unknown PDESpace preset {space_name!r}. Use 'default' or 'thermal-v2'.")
-
 
 def _is_y_only_trig(rhs: str) -> bool:
     """Return True if rhs contains sin/cos(k*pi*y) and no x symbol."""
@@ -955,8 +973,9 @@ def _run_fno_training(args: argparse.Namespace) -> None:
         n_layers=args.layers,
         lr=args.lr if args.lr is not None else 5e-4,
         lam_data=args.lam_data,
-        lam_phys=args.lam_phys,
-        lam_bc=args.lam_bc,
+        lam_phys=args.lam_phys if args.lam_phys is not None else 0.0,
+        lam_bc=args.lam_bc if args.lam_bc is not None else 0.0,
+        batch_size=getattr(args, "batch_size", 16),
         device=args.device,
     )
     save_path = (
@@ -976,41 +995,31 @@ def _run_fno_training(args: argparse.Namespace) -> None:
     log.info("FNO training complete.")
 
 
-def _run_pinn_training(args: argparse.Namespace) -> None:
-    """Instantiate PINNTrainer and run training.
-
-    Works with both the unified ``train --solver pinn`` args and the legacy
-    ``pinn`` args (``n_epochs`` vs ``epochs``; different save-path key).
-    """
-    trainer = PINNTrainer(
+def _run_deeponet_training(args: argparse.Namespace) -> None:
+    """Instantiate DeepONetTrainer and run training."""
+    trainer = DeepONetTrainer(
         n_points=args.resolution or 32,
-        hidden=args.hidden,
-        n_layers=args.layers,
+        branch_hidden=args.branch_hidden,
+        branch_layers=args.branch_layers,
+        trunk_hidden=args.trunk_hidden,
+        trunk_layers=args.trunk_layers,
+        latent_dim=args.latent_dim,
         lr=args.lr if args.lr is not None else 1e-3,
         lam_data=args.lam_data,
-        lam_phys=args.lam_phys,
-        lam_bc=args.lam_bc,
+        lam_bc=args.lam_bc if args.lam_bc is not None else 0.0,
         device=args.device,
     )
-    save_path = (
-        getattr(args, "checkpoint", None)
-        or getattr(args, "pinn_path", None)
-        or "pretrained_models/pinn.pt"
-    )
-    n_epochs = getattr(args, "n_epochs", None) or (
-        args.epochs if args.epochs is not None else 20
-    )
+    save_path = getattr(args, "checkpoint", None) or "pretrained_models/deeponet.pt"
     trainer.train(
         train_dataset_path=args.train_dataset,
         val_dataset_path=getattr(args, "val_dataset", None),
-        steps_per_problem=args.steps_per_problem,
-        n_epochs=n_epochs,
+        n_epochs=args.epochs if args.epochs is not None else 20,
         save_path=save_path,
         seed=args.seed,
         print_every=args.print_every if args.print_every is not None else 500,
         eval_every=args.eval_every if args.eval_every is not None else 1,
     )
-    log.info("PINN training complete.")
+    log.info("DeepONet training complete.")
 
 def _run_fno_testing(args: argparse.Namespace) -> None:
     """Instantiate FNOTrainer, load checkpoint, and run evaluation.
@@ -1035,24 +1044,19 @@ def _run_fno_testing(args: argparse.Namespace) -> None:
     trainer.test(test_dataset_path=args.test_dataset, print_every=args.print_every)
 
 
-def _run_pinn_testing(args: argparse.Namespace) -> None:
-    """Instantiate PINNTrainer, load checkpoint, and run evaluation.
-
-    Accepts both ``args.checkpoint`` (unified ``test``) and ``args.pinn_path``
-    (legacy ``pinn-test``).
-    """
-    trainer = PINNTrainer(
+def _run_deeponet_testing(args: argparse.Namespace) -> None:
+    """Instantiate DeepONetTrainer, load checkpoint, and run evaluation."""
+    trainer = DeepONetTrainer(
         n_points=args.resolution or 32,
-        hidden=args.hidden,
-        n_layers=args.layers,
+        branch_hidden=args.branch_hidden,
+        branch_layers=args.branch_layers,
+        trunk_hidden=args.trunk_hidden,
+        trunk_layers=args.trunk_layers,
+        latent_dim=args.latent_dim,
         device=args.device,
     )
-    ckpt_path = (
-        getattr(args, "checkpoint", None)
-        or getattr(args, "pinn_path", None)
-        or "pretrained_models/pinn.pt"
-    )
-    ckpt = torch.load(ckpt_path, map_location=str(trainer.device))
+    ckpt_path = getattr(args, "checkpoint", None) or "pretrained_models/deeponet.pt"
+    ckpt = torch.load(ckpt_path, map_location=str(trainer.device), weights_only=True)
     state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
     trainer.model.load_state_dict(state_dict)
     trainer.test(test_dataset_path=args.test_dataset, print_every=args.print_every)
@@ -1110,33 +1114,33 @@ def _run_manifest_command(args: argparse.Namespace) -> None:
 
 
 def _run_train_command(args: argparse.Namespace) -> None:
-    """Unified training flow for FNO and PINN."""
+    """Unified training flow for FNO and DeepONet."""
     if args.solver == "fno":
         if not args.train_dataset:
             raise SystemExit("train --solver fno requires --train-dataset")
         _run_fno_training(args)
         return
 
-    if args.solver == "pinn":
+    if args.solver == "deeponet":
         if not args.train_dataset:
-            raise SystemExit("train --solver pinn requires --train-dataset")
-        _run_pinn_training(args)
+            raise SystemExit("train --solver deeponet requires --train-dataset")
+        _run_deeponet_training(args)
         return
 
-    raise SystemExit(f"Unsupported solver {args.solver!r}. Use fno or pinn.")
+    raise SystemExit(f"Unsupported solver {args.solver!r}. Use fno or deeponet.")
 
 
 def _run_test_command(args: argparse.Namespace) -> None:
-    """Unified test flow for FNO and PINN."""
+    """Unified test flow for FNO and DeepONet."""
     if args.solver == "fno":
         _run_fno_testing(args)
         return
 
-    if args.solver == "pinn":
-        _run_pinn_testing(args)
+    if args.solver == "deeponet":
+        _run_deeponet_testing(args)
         return
 
-    raise SystemExit(f"Unsupported solver {args.solver!r}. Use fno or pinn.")
+    raise SystemExit(f"Unsupported solver {args.solver!r}. Use fno or deeponet.")
 
 
 # ---------------------------------------------------------------------------
@@ -1201,6 +1205,7 @@ def _run_fno_one_shot(args: argparse.Namespace) -> None:
         lam_data=args.lam_data,
         lam_phys=args.lam_phys,
         lam_bc=args.lam_bc,
+        batch_size=getattr(args, "batch_size", 16),
         device=args.device,
     )
     trainer.train(
@@ -1214,23 +1219,13 @@ def _run_fno_one_shot(args: argparse.Namespace) -> None:
     )
 
 
-def _run_pinn_one_shot(args: argparse.Namespace) -> None:
-    _alias_warning("pinn", "train --solver pinn")
-    _run_pinn_training(args)
-
-
 def _run_fno_test(args: argparse.Namespace) -> None:
     _alias_warning("fno-test", "test --solver fno")
     _run_fno_testing(args)
 
 
-def _run_pinn_test(args: argparse.Namespace) -> None:
-    _alias_warning("pinn-test", "test --solver pinn")
-    _run_pinn_testing(args)
-
-
 def _run_pdespace_smoke_command(args: argparse.Namespace) -> None:
-    cfg = _build_space_config(args.space)
+    cfg = PDESpaceConfig()
     metrics = _run_pdespace_smoke(
         config=cfg,
         n_samples=args.samples,
@@ -1240,7 +1235,7 @@ def _run_pdespace_smoke_command(args: argparse.Namespace) -> None:
         fd_max_iterations=args.fd_max_iterations,
         fd_tolerance=args.fd_tolerance,
     )
-    _print_smoke_summary(args.space, metrics)
+    _print_smoke_summary("thermal-v2", metrics)
     checks = [
         ("d_nonzero_frac",    metrics["d_nonzero_frac"],    args.min_d_nonzero),
         ("e_nonzero_frac",    metrics["e_nonzero_frac"],    args.min_e_nonzero),
@@ -1260,7 +1255,7 @@ def _run_pdespace_smoke_command(args: argparse.Namespace) -> None:
 
 def _make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Offline trainer for FNO / PINN PDE solvers"
+        description="Offline trainer for FNO / DeepONet PDE solvers"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1283,26 +1278,36 @@ def _make_parser() -> argparse.ArgumentParser:
     gen_sub.add_argument("--device", type=str, default=None)
 
     # --- unified train sub-command ---
-    train_sub = sub.add_parser("train", help="Train a solver (fno|pinn)")
-    train_sub.add_argument("--solver", type=str, choices=["fno", "pinn"], required=True)
+    train_sub = sub.add_parser("train", help="Train a solver (fno|deeponet)")
+    train_sub.add_argument("--solver", type=str, choices=["fno", "deeponet"], required=True)
     train_sub.add_argument("--train-dataset", type=str, default=None)
     train_sub.add_argument("--val-dataset", type=str, default=None)
     train_sub.add_argument("--epochs", type=int, default=None)
-    train_sub.add_argument("--steps-per-problem", type=int, default=3,
-                           help="PINN only: gradient steps per problem")
     train_sub.add_argument("--resolution", type=int, default=None)
     train_sub.add_argument("--width", type=int, default=32,
                            help="FNO only")
     train_sub.add_argument("--modes", type=int, default=12,
                            help="FNO only")
-    train_sub.add_argument("--hidden", type=int, default=64,
-                           help="PINN only")
     train_sub.add_argument("--layers", type=int, default=4)
+    train_sub.add_argument("--branch-hidden", type=int, default=128,
+                           help="DeepONet only")
+    train_sub.add_argument("--branch-layers", type=int, default=3,
+                           help="DeepONet only")
+    train_sub.add_argument("--trunk-hidden", type=int, default=128,
+                           help="DeepONet only")
+    train_sub.add_argument("--trunk-layers", type=int, default=3,
+                           help="DeepONet only")
+    train_sub.add_argument("--latent-dim", type=int, default=128,
+                           help="DeepONet only")
     train_sub.add_argument("--lr", type=float, default=None)
     train_sub.add_argument("--lam-data", type=float, default=1.0,
-                           help="FNO only")
-    train_sub.add_argument("--lam-phys", type=float, default=1.0)
-    train_sub.add_argument("--lam-bc", type=float, default=10.0)
+                           help="FNO/DeepONet supervised loss weight")
+    train_sub.add_argument("--lam-phys", type=float, default=None,
+                           help="FNO only: physics-loss weight")
+    train_sub.add_argument("--lam-bc", type=float, default=None,
+                           help="FNO default: 0.0, DeepONet default: 0.0")
+    train_sub.add_argument("--batch-size", type=int, default=16,
+                           help="FNO only: mini-batch size for dataset training")
     train_sub.add_argument("--checkpoint", type=str, default=None)
     train_sub.add_argument("--seed", type=int, default=42)
     train_sub.add_argument("--print-every", type=int, default=None)
@@ -1310,8 +1315,8 @@ def _make_parser() -> argparse.ArgumentParser:
     train_sub.add_argument("--device", type=str, default=None)
 
     # --- unified test sub-command ---
-    test_sub = sub.add_parser("test", help="Evaluate a solver checkpoint (fno|pinn)")
-    test_sub.add_argument("--solver", type=str, choices=["fno", "pinn"], required=True)
+    test_sub = sub.add_parser("test", help="Evaluate a solver checkpoint (fno|deeponet)")
+    test_sub.add_argument("--solver", type=str, choices=["fno", "deeponet"], required=True)
     test_sub.add_argument("--test-dataset", type=str, required=True,
                           help="Path to held-out test .npz dataset")
     test_sub.add_argument("--checkpoint", type=str, default=None)
@@ -1320,9 +1325,17 @@ def _make_parser() -> argparse.ArgumentParser:
                           help="FNO only")
     test_sub.add_argument("--modes", type=int, default=12,
                           help="FNO only")
-    test_sub.add_argument("--hidden", type=int, default=64,
-                          help="PINN only")
     test_sub.add_argument("--layers", type=int, default=4)
+    test_sub.add_argument("--branch-hidden", type=int, default=128,
+                          help="DeepONet only")
+    test_sub.add_argument("--branch-layers", type=int, default=3,
+                          help="DeepONet only")
+    test_sub.add_argument("--trunk-hidden", type=int, default=128,
+                          help="DeepONet only")
+    test_sub.add_argument("--trunk-layers", type=int, default=3,
+                          help="DeepONet only")
+    test_sub.add_argument("--latent-dim", type=int, default=128,
+                          help="DeepONet only")
     test_sub.add_argument("--print-every", type=int, default=10)
     test_sub.add_argument("--device", type=str, default=None)
 
@@ -1363,8 +1376,9 @@ def _make_parser() -> argparse.ArgumentParser:
     fno_train_sub.add_argument("--layers",        type=int,   default=4)
     fno_train_sub.add_argument("--lr",            type=float, default=5e-4)
     fno_train_sub.add_argument("--lam-data",      type=float, default=1.0)
-    fno_train_sub.add_argument("--lam-phys",      type=float, default=1.0)
-    fno_train_sub.add_argument("--lam-bc",        type=float, default=10.0)
+    fno_train_sub.add_argument("--lam-phys",      type=float, default=0.0)
+    fno_train_sub.add_argument("--lam-bc",        type=float, default=0.0)
+    fno_train_sub.add_argument("--batch-size",    type=int,   default=16)
     fno_train_sub.add_argument("--fno-path",      type=str,   default="pretrained_models/fno.pt")
     fno_train_sub.add_argument("--seed",          type=int,   default=42)
     fno_train_sub.add_argument("--print-every",   type=int,   default=200)
@@ -1382,8 +1396,9 @@ def _make_parser() -> argparse.ArgumentParser:
     fno_sub.add_argument("--layers",        type=int,   default=4)
     fno_sub.add_argument("--lr",            type=float, default=5e-4)
     fno_sub.add_argument("--lam-data",      type=float, default=1.0)
-    fno_sub.add_argument("--lam-phys",      type=float, default=1.0)
-    fno_sub.add_argument("--lam-bc",        type=float, default=10.0)
+    fno_sub.add_argument("--lam-phys",      type=float, default=0.0)
+    fno_sub.add_argument("--lam-bc",        type=float, default=0.0)
+    fno_sub.add_argument("--batch-size",    type=int,   default=16)
     fno_sub.add_argument("--seed",          type=int,   default=42)
     fno_sub.add_argument("--dataset-path",  type=str,   default="pretrained_models/train_data")
     fno_sub.add_argument("--val-dataset-path", type=str, default="pretrained_models/val_data")
@@ -1402,33 +1417,6 @@ def _make_parser() -> argparse.ArgumentParser:
     fno_sub.add_argument("--ood-percentile", type=float, default=95.0,
                        help="KNN threshold percentile for OOD detection (default: 95.0)")
 
-    # --- pinn sub-command ---
-    pinn_sub = sub.add_parser("pinn", help="Train the shared PINN solution operator")
-    pinn_sub.add_argument("--train-dataset",     type=str,   required=True,
-                        help="Shared dataset generated by generate/fno-generate")
-    pinn_sub.add_argument("--val-dataset",       type=str,   default=None,
-                        help="Optional validation dataset for PINN")
-    pinn_sub.add_argument("--steps-per-problem",  type=int,   default=3,
-                        help="Gradient steps per problem per visit (default: 3)")
-    pinn_sub.add_argument("--n-epochs",           type=int,   default=20,
-                        help="Full passes over the problem pool (default: 20)")
-    pinn_sub.add_argument("--resolution",         type=int,   default=32)
-    pinn_sub.add_argument("--hidden",             type=int,   default=64)
-    pinn_sub.add_argument("--layers",             type=int,   default=4)
-    pinn_sub.add_argument("--lr",                 type=float, default=1e-3)
-    pinn_sub.add_argument("--lam-data",           type=float, default=1.0,
-                        help="Data-loss weight lambda_data (default: 1.0)")
-    pinn_sub.add_argument("--lam-phys",           type=float, default=1.0,
-                        help="Physics-loss weight λ_phys (default: 1.0)")
-    pinn_sub.add_argument("--lam-bc",             type=float, default=10.0,
-                        help="BC-loss weight λ_bc (default: 10.0)")
-    pinn_sub.add_argument("--seed",               type=int,   default=42)
-    pinn_sub.add_argument("--pinn-path",          type=str,   default="pretrained_models/pinn.pt")
-    pinn_sub.add_argument("--device",             type=str,   default=None)
-    pinn_sub.add_argument("--print-every",        type=int,   default=500)
-    pinn_sub.add_argument("--eval-every",         type=int,   default=1,
-                        help="Evaluate val set every N epochs (default: 1)")
-
     # --- fno-test sub-command ---
     fno_test_sub = sub.add_parser(
         "fno-test",
@@ -1444,20 +1432,6 @@ def _make_parser() -> argparse.ArgumentParser:
     fno_test_sub.add_argument("--print-every",  type=int, default=10)
     fno_test_sub.add_argument("--device",       type=str, default=None)
 
-    # --- pinn-test sub-command ---
-    pinn_test_sub = sub.add_parser(
-        "pinn-test",
-        help="Evaluate trained PINN against FD ground truth (80/20 guardrail)",
-    )
-    pinn_test_sub.add_argument("--test-dataset", type=str, required=True,
-                             help="Path to held-out test .npz dataset")
-    pinn_test_sub.add_argument("--pinn-path",    type=str, default="pretrained_models/pinn.pt")
-    pinn_test_sub.add_argument("--resolution",   type=int, default=32)
-    pinn_test_sub.add_argument("--hidden",       type=int, default=64)
-    pinn_test_sub.add_argument("--layers",       type=int, default=4)
-    pinn_test_sub.add_argument("--print-every",  type=int, default=10)
-    pinn_test_sub.add_argument("--device",       type=str, default=None)
-
     # --- pdespace-smoke sub-command ---
     smoke_sub = sub.add_parser(
         "pdespace-smoke",
@@ -1467,7 +1441,7 @@ def _make_parser() -> argparse.ArgumentParser:
         "--space",
         type=str,
         default="thermal-v2",
-        choices=["default", "thermal-v2"],
+        choices=["thermal-v2"],
         help="PDESpace preset to evaluate",
     )
     smoke_sub.add_argument("--samples", type=int, default=240,
@@ -1518,14 +1492,8 @@ def main() -> None:
     if args.command == "fno":
         _run_fno_one_shot(args)
         return
-    if args.command == "pinn":
-        _run_pinn_one_shot(args)
-        return
     if args.command == "fno-test":
         _run_fno_test(args)
-        return
-    if args.command == "pinn-test":
-        _run_pinn_test(args)
         return
     if args.command == "pdespace-smoke":
         _run_pdespace_smoke_command(args)

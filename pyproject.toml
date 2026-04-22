@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pinn-solver-private"
 version = "0.1.0"
-description = "Private source repository for a PINN/FNO-based PDE solver and Streamlit app."
+description = "Private source repository for an FNO/DeepONet-based PDE solver and Streamlit app."
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [

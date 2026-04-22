@@ -1,6 +1,6 @@
 """FD Guardrail Evaluation Script.
 
-Evaluates a trained FNO or PINN against the FD ground truth stored in a
+Evaluates a trained FNO or DeepONet against the FD ground truth stored in a
 generated dataset.  Each sample in the dataset was solved by the FD solver
 at 64×64; this script runs the neural solver on the same inputs and computes
 per-sample and aggregate error metrics.
@@ -13,10 +13,10 @@ Usage (CLI)
         --model   pretrained_models/fno.pt \\
         --width 32 --modes 12 --layers 4
 
-    # Evaluate PINN on a held-out test dataset
-    python src/evaluate.py pinn \\
+    # Evaluate DeepONet on a held-out test dataset
+    python src/evaluate.py deeponet \\
         --dataset pretrained_models/val_data \\
-        --model   pretrained_models/pinn.pt
+        --model   pretrained_models/deeponet.pt
 
     # Evaluate FD solver only (sanity-check: should give near-zero error)
     python src/evaluate.py fd \\
@@ -49,12 +49,13 @@ import numpy as np
 # Ensure src/ is on path when invoked directly
 sys.path.insert(0, str(Path(__file__).parent))
 
+from dataset import load_dataset_artifact
 from inference_engine import (
     FDConfig,
     FNOConfig,
     GridConfig,
     InferenceEngine,
-    PINNConfig,
+    DeepONetConfig,
     SolveResult,
     SolverOption,
 )
@@ -132,10 +133,10 @@ def evaluate_dataset(
     metrics        : Per-sample EvalMetrics list.
     summary        : Dict of aggregate statistics (mean/std/max for each metric).
     """
-    npz = np.load(dataset_path, allow_pickle=True)
-    fd_targets: np.ndarray = npz["targets"]        # (N, n, n)
-    pde_strs: np.ndarray = npz["pde_strs"]         # (N,) object array of str
-    bc_json: np.ndarray = npz["bc_dict_json"]      # (N,) object array of JSON str
+    artifact = load_dataset_artifact(dataset_path)
+    fd_targets: np.ndarray = artifact.targets
+    pde_strs: np.ndarray = artifact.pde_strs
+    bc_json: np.ndarray = artifact.bc_json
 
     total = len(fd_targets)
     if n_samples is not None:
@@ -289,15 +290,16 @@ def _make_parser() -> argparse.ArgumentParser:
     fno_p.add_argument("--modes",    type=int, default=12)
     fno_p.add_argument("--layers",   type=int, default=4)
 
-    # --- pinn sub-command ---
-    pinn_p = sub.add_parser("pinn", help="Evaluate trained PINN vs FD ground truth")
-    _add_shared(pinn_p)
-    pinn_p.add_argument("--model",  required=True,
-                        help="Path to PINN .pt weights")
-    pinn_p.add_argument("--hidden", type=int, default=64)
-    pinn_p.add_argument("--layers", type=int, default=4)
-    pinn_p.add_argument("--epochs", type=int, default=500,
-                        help="Adam steps per problem (default: 500)")
+    # --- deeponet sub-command ---
+    deeponet_p = sub.add_parser("deeponet", help="Evaluate trained DeepONet vs FD ground truth")
+    _add_shared(deeponet_p)
+    deeponet_p.add_argument("--model", required=True,
+                            help="Path to DeepONet .pt weights")
+    deeponet_p.add_argument("--branch-hidden", type=int, default=128)
+    deeponet_p.add_argument("--branch-layers", type=int, default=3)
+    deeponet_p.add_argument("--trunk-hidden", type=int, default=128)
+    deeponet_p.add_argument("--trunk-layers", type=int, default=3)
+    deeponet_p.add_argument("--latent-dim", type=int, default=128)
 
     # --- fd sub-command ---
     fd_p = sub.add_parser("fd", help="Evaluate FD solver against stored FD targets (sanity check)")
@@ -339,16 +341,18 @@ def main() -> None:
             ),
         )
 
-    elif args.solver == "pinn":
+    elif args.solver == "deeponet":
         option = SolverOption(
-            solver_type="pinn",
+            solver_type="deeponet",
             device=args.device,
             grid=GridConfig(n_points=args.n_points),
-            pinn=PINNConfig(
+            deeponet=DeepONetConfig(
                 model_path=args.model,
-                hidden=args.hidden,
-                n_layers=args.layers,
-                epochs=args.epochs,
+                branch_hidden=args.branch_hidden,
+                branch_layers=args.branch_layers,
+                trunk_hidden=args.trunk_hidden,
+                trunk_layers=args.trunk_layers,
+                latent_dim=args.latent_dim,
             ),
         )
 

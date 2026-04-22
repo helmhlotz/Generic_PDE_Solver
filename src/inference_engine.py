@@ -33,17 +33,17 @@ OOD fallback  (FNO, query outside training distribution)
     Detected via a KNN check against the training-set manifest.
     Routes to FD and sets ``result.is_ood = True`` with a reason string.
 
-FD path  (solver_type="fd" or no FNO model available)
+FD path  (solver_type="fd" or no learned artifact available)
     Finite difference iterative solver using Jacobi relaxation.
 
-PINN path  (solver_type="pinn")
-    Trains a ConditionalPINN2D (optional warm-start from a state-dict).
+DeepONet path  (solver_type="deeponet")
+    Single forward pass through the fixed-resolution DeepONet operator.
 
 Offline training
 ----------------
-    Use ``src/trainer.py`` to build ``fno.pt`` and ``manifest.npz``:
+    Use ``src/trainer.py`` to build ``fno.pt`` / ``deeponet.pt`` and ``manifest.npz``:
         python src/trainer.py fno --samples 2000 --epochs 30
-        python src/trainer.py pinn --samples 200 --steps-per-problem 3 --n-epochs 20
+        python src/trainer.py train --solver deeponet --train-dataset pretrained_models/train_data
 """
 
 from __future__ import annotations
@@ -63,9 +63,12 @@ import torch.optim as optim
 # Ensure src/ is on path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from models.checkpoints import load_model_weights, read_checkpoint_arch
+from models.checkpoints import load_model_weights, read_checkpoint_arch, read_checkpoint_n_points
 from models.conditional_inputs import ConditionalGrid2D
-from models.conditional_solvers import ConditionalFNO2D, ConditionalPINN2D, _PointwiseConditionalPINNNet
+from models.conditional_solvers import (
+    ConditionalFNO2D,
+    DeepONet2DModel,
+)
 from models.fno_model import FNO2DModel
 from ood_detector import OODDetector
 from pde_parser import ParsedPDE, parse_bc, parse_pde
@@ -106,17 +109,17 @@ class FNOConfig:
 
 
 @dataclass
-class PINNConfig:
+class DeepONetConfig:
     model_path: str | None = None
     manifest_path: str | None = "pretrained_models/manifest.npz"
-    hidden: int = 64
-    n_layers: int = 4
-    epochs: int = 1000          # Adam warm-up steps (L-BFGS handles final convergence)
-    n_lbfgs_steps: int = 200   # L-BFGS refinement steps after Adam warm-up
-    early_stop_tol: float = 1e-6  # stop early when total loss drops below this
+    branch_hidden: int = 128
+    branch_layers: int = 3
+    trunk_hidden: int = 128
+    trunk_layers: int = 3
+    latent_dim: int = 128
+    epochs: int = 20
     lr: float = 1e-3
-    lambda_physics: float = 1.0
-    lambda_bc: float = 10.0
+    lambda_bc: float = 0.0
     print_every: int = 500
 
 
@@ -125,15 +128,45 @@ class SolverOption:
     """Top-level solver configuration used by InferenceEngine.
 
     Defaults route to FD with conservative settings. UI can selectively
-    override fields for FNO/PINN/FD runs.
+    override fields for FNO/DeepONet/FD runs.
     """
 
-    solver_type: Literal["fd", "fno", "pinn"] = "fd"
+    solver_type: Literal["fd", "fno", "deeponet"] = "fd"
     grid: GridConfig = field(default_factory=GridConfig)
     fd: FDConfig = field(default_factory=FDConfig)
     fno: FNOConfig = field(default_factory=FNOConfig)
-    pinn: PINNConfig = field(default_factory=PINNConfig)
+    deeponet: DeepONetConfig = field(default_factory=DeepONetConfig)
     device: str | None = None
+
+
+@dataclass(frozen=True)
+class _SolveRequest:
+    parsed_pde: ParsedPDE
+    bc_specs: dict[str, Any]
+    pde_obj: GeneralPDE
+    source_fn: Any
+    n_points: int
+    lam_bc: float
+    fno_epochs: int
+    fno_lr: float
+    deeponet_epochs: int
+    deeponet_lr: float
+    print_every: int
+
+
+@dataclass(frozen=True)
+class _SolvePlan:
+    route: Literal[
+        "fd",
+        "fd_missing_artifact",
+        "fd_resolution_mismatch",
+        "fd_ood_fallback",
+        "fno_offline",
+        "fno_torchscript",
+        "deeponet_offline",
+    ]
+    route_reason: str
+    ood_reason: str = ""
 
 # ---------------------------------------------------------------------------
 # Result dataclass
@@ -153,16 +186,18 @@ class SolveResult:
         history: list[float] | None = None,
         is_ood: bool = False,
         ood_reason: str = "",
+        route_reason: str = "",
     ):
         self.u = u                    # (n, n) numpy array — solution field
         self.xx = xx                  # (n, n) x-coordinates
         self.yy = yy                  # (n, n) y-coordinates
         self.residual = residual      # mean squared PDE residual
         self.bc_error = bc_error      # mean squared BC error
-        self.method = method          # "fno" | "fd" | "pinn" | "torchscript"
-        self.history = history or []  # loss per epoch (pinn / fd)
+        self.method = method          # "fno" | "fd" | "deeponet" | "torchscript"
+        self.history = history or []  # loss per epoch (fd)
         self.is_ood = is_ood          # True when OOD detected and FD fallback used
         self.ood_reason = ood_reason  # human-readable OOD explanation
+        self.route_reason = route_reason  # human-readable routing decision
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -175,6 +210,7 @@ class SolveResult:
             "history": self.history,
             "is_ood": self.is_ood,
             "ood_reason": self.ood_reason,
+            "route_reason": self.route_reason,
         }
 
 
@@ -318,11 +354,11 @@ def _is_torchscript(path: Path) -> bool:
         return False
 
 
-def _is_shared_pinn_checkpoint(path: str | None, device: torch.device) -> bool:
-    """Return True if *path* is a shared-PINN metadata-envelope checkpoint."""
+def _is_deeponet_checkpoint(path: str | None, device: torch.device) -> bool:
+    """Return True if *path* is a DeepONet metadata-envelope checkpoint."""
     if path is None:
         return False
-    return read_checkpoint_arch(path, device) == "shared_pinn"
+    return read_checkpoint_arch(path, device) == "deeponet"
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +372,7 @@ class InferenceEngine:
     ----------
     solver_option : SolverOption
         Full solver configuration.  Use the :class:`SolverOption`,
-        :class:`FNOConfig`, :class:`PINNConfig`, and :class:`FDConfig`
+        :class:`FNOConfig`, :class:`DeepONetConfig`, and :class:`FDConfig`
         dataclasses to build the configuration.
     """
 
@@ -353,14 +389,13 @@ class InferenceEngine:
         self.width = self.options.fno.width
         self.n_modes = self.options.fno.n_modes
         self.n_layers = self.options.fno.n_layers
-        self._pinn_model_path = self.options.pinn.model_path
-        self._pinn_hidden = self.options.pinn.hidden
-        self._pinn_layers = self.options.pinn.n_layers
-
         self._model: FNO2DModel | None = None
         self._jit_model = None  # set when a TorchScript archive is loaded
         self._ood_detector: OODDetector | None = None
-        self._pinn_net: _PointwiseConditionalPINNNet | None = None
+        self._deeponet_model: DeepONet2DModel | None = None
+        self._has_fno_artifact = False
+        self._has_deeponet_artifact = False
+        self._deeponet_n_points: int | None = None
 
         if self.options.solver_type == "fno":
             self._model = FNO2DModel(
@@ -376,10 +411,12 @@ class InferenceEngine:
                     if _is_torchscript(p):
                         self._jit_model = torch.jit.load(str(p), map_location=self.device)
                         self._jit_model.eval()
+                        self._has_fno_artifact = True
                         print(f"Loaded TorchScript FNO from {p}")
                     else:
                         load_model_weights(self._model, str(p), self.device)
                         self._model.eval()
+                        self._has_fno_artifact = True
                         # torch.compile + FFT kernels can fail at runtime on some
                         # backends/versions (stride/layout assertions in _fft_c2c).
                         # Keep eager mode as the default for reliability; allow
@@ -390,31 +427,39 @@ class InferenceEngine:
                             print("Enabled torch.compile for FNO (FNO_ENABLE_TORCH_COMPILE=1)")
                         print(f"Loaded conditional FNO from {p}")
                 else:
-                    print(f"FNO model path {p} not found; solve() will fall back to online training.")
+                    print(f"FNO model path {p} not found; solve() will fall back to FD.")
             manifest = self.options.fno.manifest_path
             if manifest is not None and OODDetector.is_available(manifest):
                 self._ood_detector = OODDetector(manifest)
                 print(f"OOD detector loaded from {manifest}")
-        elif self.options.solver_type == "pinn":
-            self._pinn_net = _PointwiseConditionalPINNNet(
-                in_channels=7,
-                hidden=self.options.pinn.hidden,
-                n_layers=self.options.pinn.n_layers,
-            ).to(self.device)
-            if self.options.pinn.model_path is not None:
-                p = Path(self.options.pinn.model_path)
+        elif self.options.solver_type == "deeponet":
+            if self.options.deeponet.model_path is not None:
+                p = Path(self.options.deeponet.model_path)
                 if p.exists():
+                    self._deeponet_n_points = read_checkpoint_n_points(str(p), self.device)
+                    if self._deeponet_n_points is None:
+                        self._deeponet_n_points = self.options.grid.n_points
+                    self._deeponet_model = DeepONet2DModel(
+                        n_points=self._deeponet_n_points,
+                        in_channels=7,
+                        branch_hidden=self.options.deeponet.branch_hidden,
+                        branch_layers=self.options.deeponet.branch_layers,
+                        trunk_hidden=self.options.deeponet.trunk_hidden,
+                        trunk_layers=self.options.deeponet.trunk_layers,
+                        latent_dim=self.options.deeponet.latent_dim,
+                    ).to(self.device)
                     load_model_weights(
-                        self._pinn_net,
-                        self.options.pinn.model_path,
+                        self._deeponet_model,
+                        self.options.deeponet.model_path,
                         self.device,
                         skip_if_torchscript=True,
                     )
-                    self._pinn_net.eval()
-                    print(f"Loaded PINN model from {self.options.pinn.model_path}")
+                    self._deeponet_model.eval()
+                    self._has_deeponet_artifact = True
+                    print(f"Loaded DeepONet model from {self.options.deeponet.model_path}")
                 else:
-                    print(f"PINN model path {p} not found; solve() will fall back to online training.")
-            manifest = self.options.pinn.manifest_path
+                    print(f"DeepONet model path {p} not found; solve() will fall back to FD.")
+            manifest = self.options.deeponet.manifest_path
             if manifest is not None and OODDetector.is_available(manifest):
                 self._ood_detector = OODDetector(manifest)
                 print(f"OOD detector loaded from {manifest}")
@@ -426,12 +471,11 @@ class InferenceEngine:
         bc_dict: dict[str, dict],
         ic_str: str | None = None,
         n_points: int | None = None,
-        lambda_physics: float | None = None,
         lambda_bc: float | None = None,
         fno_epochs: int | None = None,
         fno_lr: float | None = None,
-        pinn_epochs: int | None = None,
-        pinn_lr: float | None = None,
+        deeponet_epochs: int | None = None,
+        deeponet_lr: float | None = None,
         print_every: int | None = None,
     ) -> SolveResult:
         """Parse PDE + BCs and return the solution field.
@@ -442,12 +486,11 @@ class InferenceEngine:
         bc_dict         : per-wall BCs dict.
         ic_str          : initial condition for time-dependent PDEs (optional).
         n_points        : grid resolution (n × n); defaults to GridConfig.n_points.
-        lambda_physics  : physics-loss weight for PINN.
-        lambda_bc       : BC-loss weight for PINN.
+        lambda_bc       : BC-loss weight for FNO/DeepONet.
         fno_epochs      : epochs for online FNO training (overrides FNO-online default).
         fno_lr          : learning rate for online FNO training.
-        pinn_epochs     : Adam epochs for the PINN path (overrides PINNConfig).
-        pinn_lr         : learning rate for the PINN path (overrides PINNConfig).
+        deeponet_epochs : retained for API symmetry; DeepONet v1 is offline only.
+        deeponet_lr     : retained for API symmetry; DeepONet v1 is offline only.
         print_every     : log interval for iterative solvers.
 
         Returns
@@ -455,153 +498,219 @@ class InferenceEngine:
         SolveResult
             ``result.is_ood == True`` when an FNO OOD detection triggered FD fallback.
         """
-        # --- 1. Parse ---
+        request = self._build_request(
+            pde_str=pde_str,
+            bc_dict=bc_dict,
+            ic_str=ic_str,
+            n_points=n_points,
+            lambda_bc=lambda_bc,
+            fno_epochs=fno_epochs,
+            fno_lr=fno_lr,
+            deeponet_epochs=deeponet_epochs,
+            deeponet_lr=deeponet_lr,
+            print_every=print_every,
+        )
+        plan = self._plan_solve(request)
+        return self._execute_plan(request, plan)
+
+    def _build_request(
+        self,
+        *,
+        pde_str: str,
+        bc_dict: dict[str, dict],
+        ic_str: str | None,
+        n_points: int | None,
+        lambda_bc: float | None,
+        fno_epochs: int | None,
+        fno_lr: float | None,
+        deeponet_epochs: int | None,
+        deeponet_lr: float | None,
+        print_every: int | None,
+    ) -> _SolveRequest:
         parsed_pde = parse_pde(pde_str)
-        bc_specs   = parse_bc(bc_dict)
+        bc_specs = parse_bc(bc_dict)
 
         if parsed_pde.is_time_dependent:
             raise NotImplementedError(
                 "Time-dependent PDEs are not supported by the current inference paths. "
-                "The active FNO/PINN/FD solvers only handle steady-state problems."
+                "The active FNO/DeepONet/FD solvers only handle steady-state problems."
             )
 
         ic_specs = None
         if ic_str and parsed_pde.is_time_dependent:
             from pde_parser import parse_ic
+
             ic_specs = parse_ic(ic_str)
 
-        pde_obj   = GeneralPDE(parsed_pde, bc_specs, ic_specs)
+        pde_obj = GeneralPDE(parsed_pde, bc_specs, ic_specs)
         source_fn = parsed_pde.rhs_fn()
 
-        # --- 2. Resolve effective runtime options ---
-        n_points_eff   = int(n_points if n_points is not None else self.options.grid.n_points)
-        fno_cfg        = self.options.fno
-        pinn_cfg       = self.options.pinn
-        fd_cfg         = self.options.fd
-        solver_type    = self.options.solver_type
+        n_points_eff = int(n_points if n_points is not None else self.options.grid.n_points)
+        fno_cfg = self.options.fno
+        deeponet_cfg = self.options.deeponet
+        fd_cfg = self.options.fd
+        solver_type = self.options.solver_type
 
-        lam_phys_eff = float(
-            lambda_physics if lambda_physics is not None else (
-                fno_cfg.lambda_physics if solver_type == "fno" else pinn_cfg.lambda_physics
-            )
-        )
         lam_bc_eff = float(
             lambda_bc if lambda_bc is not None else (
-                fno_cfg.lambda_bc if solver_type == "fno" else pinn_cfg.lambda_bc
+                fno_cfg.lambda_bc if solver_type == "fno" else deeponet_cfg.lambda_bc
             )
         )
-        # Keep backward compatibility: when fno_* are omitted, fall back to
-        # legacy pinn_* overrides for the FNO online path.
-        fno_epochs_eff  = int(
+        fno_epochs_eff = int(
             fno_epochs if fno_epochs is not None else (
-                pinn_epochs if pinn_epochs is not None else pinn_cfg.epochs
+                deeponet_epochs if deeponet_epochs is not None else deeponet_cfg.epochs
             )
         )
-        fno_lr_eff      = float(
+        fno_lr_eff = float(
             fno_lr if fno_lr is not None else (
-                pinn_lr if pinn_lr is not None else pinn_cfg.lr
+                deeponet_lr if deeponet_lr is not None else deeponet_cfg.lr
             )
         )
-        pinn_epochs_eff = int(pinn_epochs if pinn_epochs is not None else pinn_cfg.epochs)
-        pinn_lr_eff     = float(pinn_lr if pinn_lr is not None else pinn_cfg.lr)
+        deeponet_epochs_eff = int(
+            deeponet_epochs if deeponet_epochs is not None else deeponet_cfg.epochs
+        )
+        deeponet_lr_eff = float(deeponet_lr if deeponet_lr is not None else deeponet_cfg.lr)
         print_every_eff = int(
             print_every if print_every is not None else (
-                fno_cfg.print_every  if solver_type == "fno"  else
-                pinn_cfg.print_every if solver_type == "pinn" else
+                fno_cfg.print_every if solver_type == "fno" else
+                deeponet_cfg.print_every if solver_type == "deeponet" else
                 fd_cfg.print_every
             )
         )
 
-        # --- 3. Route by configured solver type ---
-        if solver_type == "fno":
-            # File existence check: if no model file, fall back to online FNO training
-            if fno_cfg.model_path is None or not Path(fno_cfg.model_path).exists():
-                print("FNO model file not found; using online FNO training...")
-                return self._fno_online_path(
-                    parsed_pde, bc_specs, pde_obj, source_fn, n_points_eff,
-                    lam_phys=lam_phys_eff, lam_bc=lam_bc_eff,
-                    n_epochs=fno_epochs_eff, lr=fno_lr_eff,
-                    print_every=print_every_eff,
-                    pretrained_path=fno_cfg.model_path,
-                )
-            fd_fallback = self._maybe_ood_fd_fallback(
-                parsed_pde=parsed_pde,
-                bc_specs=bc_specs,
-                pde_obj=pde_obj,
-                n_points=n_points_eff,
-                print_every=print_every_eff,
-            )
-            if fd_fallback is not None:
-                return fd_fallback
-
-            if self._jit_model is not None:
-                return self._jit_path(parsed_pde, bc_specs, pde_obj, source_fn, n_points_eff)
-            if self._model is None:
-                print("FNO model not loaded; using online FNO training...")
-                return self._fno_online_path(
-                    parsed_pde, bc_specs, pde_obj, source_fn, n_points_eff,
-                    lam_phys=lam_phys_eff, lam_bc=lam_bc_eff,
-                    n_epochs=fno_epochs_eff, lr=fno_lr_eff,
-                    print_every=print_every_eff,
-                    pretrained_path=fno_cfg.model_path,
-                )
-            print("Using FNO solver (offline)...")
-            return self._fno_path(
-                pde_obj=pde_obj,
-                n_points=n_points_eff,
-            )
-
-        if solver_type == "pinn":
-            # File existence check: if no model file, use online PINN training
-            if pinn_cfg.model_path is None or not Path(pinn_cfg.model_path).exists():
-                print("PINN model file not found; using online PINN training...")
-                return self._pinn_online_path(
-                    pde_obj=pde_obj,
-                    n_points=n_points_eff,
-                    n_epochs=pinn_epochs_eff,
-                    lr=pinn_lr_eff,
-                    lam_phys=lam_phys_eff,
-                    lam_bc=lam_bc_eff,
-                    print_every=print_every_eff,
-                    n_lbfgs_steps=pinn_cfg.n_lbfgs_steps,
-                    early_stop_tol=pinn_cfg.early_stop_tol,
-                )
-            fd_fallback = self._maybe_ood_fd_fallback(
-                parsed_pde=parsed_pde,
-                bc_specs=bc_specs,
-                pde_obj=pde_obj,
-                n_points=n_points_eff,
-                print_every=print_every_eff,
-            )
-            if fd_fallback is not None:
-                return fd_fallback
-            if self._pinn_net is None:
-                print("PINN model not loaded; using online PINN training...")
-                return self._pinn_online_path(
-                    pde_obj=pde_obj,
-                    n_points=n_points_eff,
-                    n_epochs=pinn_epochs_eff,
-                    lr=pinn_lr_eff,
-                    lam_phys=lam_phys_eff,
-                    lam_bc=lam_bc_eff,
-                    print_every=print_every_eff,
-                    n_lbfgs_steps=pinn_cfg.n_lbfgs_steps,
-                    early_stop_tol=pinn_cfg.early_stop_tol,
-                )
-            print("Using PINN solver (offline)...")
-            return self._pinn_path(
-                pde_obj=pde_obj,
-                n_points=n_points_eff,
-            )
-
-        print("Using finite difference solver...")
-        return self._fd_path(
-            pde_obj,
-            n_points_eff,
-            print_every_eff,
-            max_iterations=fd_cfg.max_iterations,
-            tolerance=fd_cfg.tolerance,
+        return _SolveRequest(
+            parsed_pde=parsed_pde,
+            bc_specs=bc_specs,
+            pde_obj=pde_obj,
+            source_fn=source_fn,
+            n_points=n_points_eff,
+            lam_bc=lam_bc_eff,
+            fno_epochs=fno_epochs_eff,
+            fno_lr=fno_lr_eff,
+            deeponet_epochs=deeponet_epochs_eff,
+            deeponet_lr=deeponet_lr_eff,
+            print_every=print_every_eff,
         )
+
+    def _plan_solve(self, request: _SolveRequest) -> _SolvePlan:
+        solver_type = self.options.solver_type
+        if solver_type == "fd":
+            return _SolvePlan("fd", "solver_type=fd")
+
+        if solver_type == "fno":
+            if not self._has_fno_artifact:
+                return _SolvePlan(
+                    "fd_missing_artifact",
+                    "FNO artifact unavailable; using FD fallback.",
+                )
+            is_ood, ood_reason = self._check_ood(request=request)
+            if is_ood:
+                return _SolvePlan(
+                    "fd_ood_fallback",
+                    f"OOD detected ({ood_reason}); using FD fallback.",
+                    ood_reason=ood_reason,
+                )
+            if self._jit_model is not None:
+                return _SolvePlan("fno_torchscript", "Using TorchScript FNO artifact.")
+            if self._model is not None:
+                return _SolvePlan("fno_offline", "Using loaded FNO operator artifact.")
+            return _SolvePlan(
+                "fd_missing_artifact",
+                "FNO model state unavailable after load; using FD fallback.",
+            )
+
+        if solver_type == "deeponet":
+            if not self._has_deeponet_artifact or self._deeponet_model is None:
+                return _SolvePlan(
+                    "fd_missing_artifact",
+                    "DeepONet artifact unavailable; using FD fallback.",
+                )
+            if self._deeponet_n_points is not None and request.n_points != self._deeponet_n_points:
+                return _SolvePlan(
+                    "fd_resolution_mismatch",
+                    "DeepONet resolution mismatch; using FD fallback.",
+                )
+            is_ood, ood_reason = self._check_ood(request=request)
+            if is_ood:
+                return _SolvePlan(
+                    "fd_ood_fallback",
+                    f"OOD detected ({ood_reason}); using FD fallback.",
+                    ood_reason=ood_reason,
+                )
+            return _SolvePlan("deeponet_offline", "Using loaded DeepONet operator artifact.")
+
+        raise RuntimeError(f"Unsupported solver type {solver_type!r}")
+
+    def _execute_plan(self, request: _SolveRequest, plan: _SolvePlan) -> SolveResult:
+        print(plan.route_reason)
+        if plan.route == "fd":
+            result = self._fd_path(
+                request.pde_obj,
+                request.n_points,
+                request.print_every,
+                max_iterations=self.options.fd.max_iterations,
+                tolerance=self.options.fd.tolerance,
+            )
+            result.route_reason = plan.route_reason
+            return result
+
+        if plan.route == "fd_missing_artifact":
+            return self._fallback_to_fd(
+                pde_obj=request.pde_obj,
+                n_points=request.n_points,
+                print_every=request.print_every,
+                method="fd_missing_artifact",
+                route_reason=plan.route_reason,
+            )
+
+        if plan.route == "fd_resolution_mismatch":
+            return self._fallback_to_fd(
+                pde_obj=request.pde_obj,
+                n_points=request.n_points,
+                print_every=request.print_every,
+                method="fd_resolution_mismatch",
+                route_reason=plan.route_reason,
+            )
+
+        if plan.route == "fd_ood_fallback":
+            return self._fallback_to_fd(
+                pde_obj=request.pde_obj,
+                n_points=request.n_points,
+                print_every=request.print_every,
+                method="fd_fallback",
+                route_reason=plan.route_reason,
+                is_ood=True,
+                ood_reason=plan.ood_reason,
+            )
+
+        if plan.route == "fno_torchscript":
+            result = self._jit_path(
+                request.parsed_pde,
+                request.bc_specs,
+                request.pde_obj,
+                request.source_fn,
+                request.n_points,
+            )
+            result.route_reason = plan.route_reason
+            return result
+
+        if plan.route == "fno_offline":
+            result = self._fno_path(
+                pde_obj=request.pde_obj,
+                n_points=request.n_points,
+            )
+            result.route_reason = plan.route_reason
+            return result
+
+        if plan.route == "deeponet_offline":
+            result = self._deeponet_path(
+                pde_obj=request.pde_obj,
+                n_points=request.n_points,
+            )
+            result.route_reason = plan.route_reason
+            return result
+
+        raise RuntimeError(f"Unhandled solve route {plan.route!r}")
 
     # ------------------------------------------------------------------
     def _jit_path(
@@ -626,12 +735,13 @@ class InferenceEngine:
                 )
                 # Clear JIT model and use FD fallback
                 self._jit_model = None
-                return self._fd_path(
-                    pde_obj,
-                    n_points,
+                self._has_fno_artifact = False
+                return self._fallback_to_fd(
+                    pde_obj=pde_obj,
+                    n_points=n_points,
                     print_every=500,
-                    max_iterations=self.options.fd.max_iterations,
-                    tolerance=self.options.fd.tolerance,
+                    method="fd_runtime_fallback",
+                    route_reason="TorchScript model resolution mismatch; using FD fallback.",
                 )
             raise
 
@@ -646,33 +756,39 @@ class InferenceEngine:
             method="torchscript",
         )
 
-    def _maybe_ood_fd_fallback(
+    def _check_ood(
         self,
         *,
-        parsed_pde: ParsedPDE,
-        bc_specs: dict,
+        request: _SolveRequest,
+    ) -> tuple[bool, str]:
+        """Return ``(is_ood, reason)`` for the current solve request."""
+        if self._ood_detector is None:
+            return False, ""
+        return self._ood_detector.check(request.parsed_pde, request.bc_specs)
+
+    def _fallback_to_fd(
+        self,
+        *,
         pde_obj: GeneralPDE,
         n_points: int,
         print_every: int,
-    ) -> SolveResult | None:
-        """Return FD fallback result when query is OOD, otherwise None."""
-        if self._ood_detector is None:
-            return None
-        is_ood, ood_reason = self._ood_detector.check(parsed_pde, bc_specs)
-        if not is_ood:
-            return None
-        print(f"OOD detected ({ood_reason}); falling back to FD solver.")
-        fd_result = self._fd_path(
+        method: str,
+        route_reason: str,
+        is_ood: bool = False,
+        ood_reason: str = "",
+    ) -> SolveResult:
+        result = self._fd_path(
             pde_obj,
             n_points,
             print_every,
             max_iterations=self.options.fd.max_iterations,
             tolerance=self.options.fd.tolerance,
         )
-        fd_result.is_ood = True
-        fd_result.ood_reason = ood_reason
-        fd_result.method = "fd_fallback"
-        return fd_result
+        result.method = method
+        result.route_reason = route_reason
+        result.is_ood = is_ood
+        result.ood_reason = ood_reason
+        return result
 
     def _offline_grid_path(
         self,
@@ -818,59 +934,16 @@ class InferenceEngine:
         )
 
     # ------------------------------------------------------------------
-    def _pinn_path(
+    def _deeponet_path(
         self,
         pde_obj: GeneralPDE,
         n_points: int,
     ) -> SolveResult:
-        if self._pinn_net is None:
-            raise RuntimeError("PINN model is not loaded for offline inference.")
+        if self._deeponet_model is None:
+            raise RuntimeError("DeepONet model is not loaded for offline inference.")
         return self._offline_grid_path(
-            model=self._pinn_net,
+            model=self._deeponet_model,
             pde_obj=pde_obj,
             n_points=n_points,
-            method="pinn",
-        )
-
-    # ------------------------------------------------------------------
-    def _pinn_online_path(
-        self,
-        pde_obj: GeneralPDE,
-        n_points: int,
-        n_epochs: int,
-        lr: float,
-        lam_phys: float,
-        lam_bc: float,
-        print_every: int,
-        n_lbfgs_steps: int = 200,
-        early_stop_tol: float = 1e-6,
-    ) -> SolveResult:
-        """Per-problem online PINN training when no pre-trained weights are available."""
-        model = ConditionalPINN2D(
-            parsed_pde=pde_obj.parsed_pde,
-            bc_specs=pde_obj.bc_specs,
-            ic_specs=pde_obj.ic_specs,
-            n_points=n_points,
-            lr=lr,
-            lambda_physics=lam_phys,
-            lambda_bc=lam_bc,
-            hidden=self._pinn_hidden,
-            n_layers=self._pinn_layers,
-            pretrained_path=None,
-            device=str(self.device),
-        )
-        model.train(
-            n_epochs=n_epochs,
-            print_every=print_every,
-            n_lbfgs_steps=n_lbfgs_steps,
-            early_stop_tol=early_stop_tol,
-        )
-        eval_out = model.evaluate(n_eval=n_points, t=0.0)
-        history = model.history.get("total", [])
-        return self._online_eval_to_result(
-            pde_obj=pde_obj,
-            eval_out=eval_out,
-            n_points=n_points,
-            method="pinn",
-            history=history,
+            method="deeponet",
         )

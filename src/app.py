@@ -1,4 +1,4 @@
-"""Streamlit web UI for thermal-focused scalar PINN/FNO inference.
+"""Streamlit web UI for thermal-focused scalar DeepONet/FNO inference.
 
 Launch:
     cd /path/to/FNO
@@ -29,7 +29,7 @@ from inference_engine import (
     GridConfig,
     FDConfig,
     FNOConfig,
-    PINNConfig,
+    DeepONetConfig,
 )
 
 # ---------------------------------------------------------------------------
@@ -87,12 +87,12 @@ with st.sidebar:
     st.subheader("Solver")
 
     use_pretrained = st.toggle("Use pretrained model", value=True)
-    solver_type = st.radio("Solver type", ["FNO", "PINN", "FD"], horizontal=True)
+    solver_type = st.radio("Solver type", ["FNO", "DeepONet", "FD"], horizontal=True)
     fno_path: str | None = None
-    pinn_path: str | None = None
+    deeponet_path: str | None = None
 
     if solver_type == "FD":
-        st.warning("FD solver selected: the app will skip FNO/PINN and use finite difference.")
+        st.warning("FD solver selected: the app will skip FNO/DeepONet and use finite difference.")
     elif use_pretrained:
         if solver_type == "FNO":
             fno_path_val = st.text_input(
@@ -102,12 +102,12 @@ with st.sidebar:
             )
             fno_path = fno_path_val.strip() or None
         else:
-            pinn_path_val = st.text_input(
-                "PINN weights path",
-                value="pretrained_models/pinn.pt",
-                help="State-dict (.pt) of the pretrained MLP PINN for offline inference.",
+            deeponet_path_val = st.text_input(
+                "DeepONet weights path",
+                value="pretrained_models/deeponet.pt",
+                help="State-dict (.pt) of the pretrained DeepONet for offline inference.",
             )
-            pinn_path = pinn_path_val.strip() or None
+            deeponet_path = deeponet_path_val.strip() or None
 
     with st.expander("FD / Fallback configuration", expanded=False):
         fd_max_iterations = st.number_input(
@@ -145,19 +145,28 @@ with st.sidebar:
         else:
             fno_width, fno_modes, fno_layers = 32, 12, 4
             st.caption("Using pretrained FNO: architecture controls are hidden.")
-        pinn_hidden, pinn_layers_n = 64, 4
-    elif solver_type == "PINN":
+        branch_hidden, branch_layers_n = 128, 3
+        trunk_hidden, trunk_layers_n = 128, 3
+        latent_dim = 128
+    elif solver_type == "DeepONet":
         if not use_pretrained:
-            with st.expander("PINN configuration", expanded=False):
-                pinn_hidden   = st.number_input("Hidden units per layer", value=64, min_value=16, step=16, key="pinn_hidden")
-                pinn_layers_n = st.number_input("Number of layers",       value=4,  min_value=2,  step=1,  key="pinn_layers")
+            with st.expander("DeepONet configuration", expanded=False):
+                branch_hidden = st.number_input("Branch hidden units", value=128, min_value=16, step=16, key="deeponet_branch_hidden")
+                branch_layers_n = st.number_input("Branch layers", value=3, min_value=1, step=1, key="deeponet_branch_layers")
+                trunk_hidden = st.number_input("Trunk hidden units", value=128, min_value=16, step=16, key="deeponet_trunk_hidden")
+                trunk_layers_n = st.number_input("Trunk layers", value=3, min_value=1, step=1, key="deeponet_trunk_layers")
+                latent_dim = st.number_input("Latent dimension", value=128, min_value=8, step=8, key="deeponet_latent_dim")
         else:
-            pinn_hidden, pinn_layers_n = 64, 4
-            st.caption("Using pretrained PINN: architecture controls are hidden.")
+            branch_hidden, branch_layers_n = 128, 3
+            trunk_hidden, trunk_layers_n = 128, 3
+            latent_dim = 128
+            st.caption("Using pretrained DeepONet: architecture controls are hidden.")
         fno_width, fno_modes, fno_layers = 32, 12, 4
     else:
         fno_width, fno_modes, fno_layers = 32, 12, 4
-        pinn_hidden, pinn_layers_n = 64, 4
+        branch_hidden, branch_layers_n = 128, 3
+        trunk_hidden, trunk_layers_n = 128, 3
+        latent_dim = 128
 
     st.divider()
     st.subheader("Training")
@@ -178,19 +187,19 @@ with st.sidebar:
                 min_value=1e-5, max_value=1e-1, value=1e-3, format="%.5f",
                 help="Learning rate for per-problem online FNO fitting.",
             )
-        pinn_epochs = 3000
-    elif solver_type == "PINN":
+        deeponet_epochs = 20
+    elif solver_type == "DeepONet":
         if use_pretrained:
-            pinn_epochs = 3000  # offline forward pass — no training loop runs
-            st.info("Training epochs not applicable when using a pretrained PINN (offline forward pass).")
+            deeponet_epochs = 20
+            st.info("Training epochs are not used for pretrained DeepONet inference.")
         else:
-            pinn_epochs = st.number_input(
+            deeponet_epochs = st.number_input(
                 "Training epochs",
-                min_value=100, max_value=10000, value=3000, step=100,
-                help="Number of gradient steps for the MLP PINN.",
+                min_value=1, max_value=1000, value=20, step=1,
+                help="Configured for parity with the training CLI; DeepONet app inference remains offline-only.",
             )
     else:
-        pinn_epochs = 3000
+        deeponet_epochs = 20
 
     st.divider()
     lam_phys = st.number_input("λ physics", value=1.0,  min_value=0.01)
@@ -309,9 +318,9 @@ if st.button("Solve", type="primary", disabled=solve_disabled, use_container_wid
                             "3. Uncheck 'Use pretrained model' to train from scratch")
                     st.session_state.pop("result", None)
                     st.stop()
-            elif solver_type == "PINN":
+            elif solver_type == "DeepONet":
                 option = SolverOption(
-                    solver_type="pinn",
+                    solver_type="deeponet",
                     device="cpu",
                     grid=GridConfig(n_points=int(n_points)),
                     fd=FDConfig(
@@ -319,13 +328,15 @@ if st.button("Solve", type="primary", disabled=solve_disabled, use_container_wid
                         tolerance=float(fd_tolerance),
                         print_every=int(fd_print_every),
                     ),
-                    pinn=PINNConfig(
-                        model_path=pinn_path if use_pretrained else None,
-                        manifest_path=_derive_manifest_path(pinn_path),
-                        hidden=int(pinn_hidden),
-                        n_layers=int(pinn_layers_n),
-                        epochs=int(pinn_epochs),
-                        lambda_physics=float(lam_phys),
+                    deeponet=DeepONetConfig(
+                        model_path=deeponet_path if use_pretrained else None,
+                        manifest_path=_derive_manifest_path(deeponet_path),
+                        branch_hidden=int(branch_hidden),
+                        branch_layers=int(branch_layers_n),
+                        trunk_hidden=int(trunk_hidden),
+                        trunk_layers=int(trunk_layers_n),
+                        latent_dim=int(latent_dim),
+                        epochs=int(deeponet_epochs),
                         lambda_bc=float(lam_bc),
                     ),
                 )
@@ -334,7 +345,7 @@ if st.button("Solve", type="primary", disabled=solve_disabled, use_container_wid
                 try:
                     engine = InferenceEngine(solver_option=option)
                 except (FileNotFoundError, RuntimeError) as model_err:
-                    st.error(f"**PINN Model Error:** {model_err}")
+                    st.error(f"**DeepONet Model Error:** {model_err}")
                     st.info("**Suggestions:**\n"
                             "1. Check the model file path is correct\n"
                             "2. Verify the file is a valid PyTorch model\n"
@@ -342,7 +353,7 @@ if st.button("Solve", type="primary", disabled=solve_disabled, use_container_wid
                     st.session_state.pop("result", None)
                     st.stop()
             else:
-                st.warning("Using FD solver only (FNO/PINN disabled by Solver type).")
+                st.warning("Using FD solver only (FNO/DeepONet disabled by Solver type).")
                 option = SolverOption(
                     solver_type="fd",
                     device="cpu",
@@ -366,8 +377,6 @@ if st.button("Solve", type="primary", disabled=solve_disabled, use_container_wid
             if solver_type == "FNO" and not use_pretrained:
                 solve_kwargs["fno_epochs"] = int(fno_online_epochs)
                 solve_kwargs["fno_lr"] = float(fno_online_lr)
-            if solver_type == "PINN" and not use_pretrained:
-                solve_kwargs["pinn_epochs"] = int(pinn_epochs)
             result = engine.solve(
                 **solve_kwargs,
             )

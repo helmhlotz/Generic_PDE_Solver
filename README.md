@@ -24,9 +24,9 @@ The key design concern is **orchestration**: how offline training pipelines, run
 │       ├──► FNOTrainer ──► fno.pt + fno_best.pt                  │
 │       │      hybrid loss: data + physics + BC                   │
 │       │                                                         │
-│       ├──► PINNTrainer ──────► pinn.pt + pinn_best.pt           │
-│       │      dataset-driven; hybrid loss: data + physics + BC    │
-│       │      mirrors FNO loop (cosine LR + epoch validation)     │
+│       ├──► DeepONetTrainer ─► deeponet.pt + deeponet_best.pt   │
+│       │      fixed-resolution operator learning (data + optional BC) │
+│       │      mirrors FNO loop (cosine LR + epoch validation)    │
 │       │                                                         │
 │       │   Both trainers share _DatasetTrainerBase               │
 │       │   (PDEOperatorDataset + DataLoader, auto 80/20 split)   │
@@ -53,11 +53,11 @@ The key design concern is **orchestration**: how offline training pipelines, run
 │       │                   │ in-dist? ──► _fno_path (offline)   │
 │       │                   │ OOD?     ──► _fd_path + is_ood=True │
 │       │                                                         │
-│       ├── "pinn"                                                │
-│       │    │  model file / model object missing?                │
-│       │    ├── Yes ──► _pinn_online_path (ConditionalPINN2D)│
+│       ├── "deeponet"                                            │
+│       │    │  model file missing / resolution mismatch?         │
+│       │    ├── Yes ──► _fd_path                                 │
 │       │    └── No  ──► _maybe_ood_fd_fallback()                 │
-│       │                   │ in-dist? ──► _pinn_path (offline)   │
+│       │                   │ in-dist? ──► _deeponet_path         │
 │       │                   │ OOD?     ──► _fd_path + is_ood=True │
 │       │                                                         │
 │       └── "fd"  ──► _fd_path (_FDSolver, Jacobi relaxation)    │
@@ -69,7 +69,7 @@ The key design concern is **orchestration**: how offline training pipelines, run
 ┌─────────────────────────────────────────────────────────────────┐
 │                         STREAMLIT UI                            │
 │                                                                 │
-│  app.py ──► SolverOption (GridConfig, FNOConfig, PINNConfig,    │
+│  app.py ──► SolverOption (GridConfig, FNOConfig, DeepONetConfig,│
 │              FDConfig)  ──► InferenceEngine ──► SolveResult     │
 │  launcher.py: single-binary entry via streamlit CLI             │
 └─────────────────────────────────────────────────────────────────┘
@@ -84,8 +84,8 @@ src/
 ├── app.py                    Streamlit UI; builds SolverOption from widgets
 ├── launcher.py               PyInstaller-compatible entry point
 ├── trainer.py                CLI + API for data generation and training;
-│                              _DatasetTrainerBase shared loader abstraction for FNO + PINN
-├── inference_engine.py       Runtime routing engine; mirrored FNO/PINN solve skeleton
+│                              _DatasetTrainerBase shared loader abstraction for FNO + DeepONet
+├── inference_engine.py       Runtime routing engine; mirrored FNO/DeepONet solve skeleton
 ├── evaluate.py               Standalone FD-guardrail evaluation script
 ├── pde_parser.py             Sympy-based PDE and BC string parser
 ├── pde_space.py              PDESpaceConfig, LHSSampler, BCGenerator
@@ -95,8 +95,7 @@ src/
 │   ├── fno_model.py          FNO2DModel (channel-last, 7-ch input)
 │   ├── fno_layers.py         FNOBlock, SpectralConv2d, GridEmbedding2D
 │   ├── conditional_inputs.py ConditionalGrid2D — builds 7-channel input tensor
-│   ├── conditional_solvers.py ConditionalFNO2D, ConditionalPINN2D,
-│   │                          _PointwiseConditionalPINNNet
+│   ├── conditional_solvers.py ConditionalFNO2D, DeepONet2DModel
 │   └── checkpoints.py        load_model_weights, read_checkpoint_arch
 │
 └── physics/
@@ -132,7 +131,7 @@ python src/trainer.py generate \
 
 Data generation and model training are decoupled, enabling independent reuse of each stage.
 
-Both `FNOTrainer` and `PINNTrainer` inherit `_DatasetTrainerBase`, which provides a single `_build_loaders_from_datasets()` method: it loads a `PDEOperatorDataset`, wraps it in a `DataLoader` (`batch_size=1`), and optionally performs a deterministic 80/20 train/val split when `--val-dataset` is omitted. Their train/test scaffolding is now mirrored through shared `_train_from_dataset()` and `_test_from_dataset()` paths, with solver-specific behavior isolated to small hook methods.
+Both `FNOTrainer` and `DeepONetTrainer` inherit `_DatasetTrainerBase`, which provides a single `_build_loaders_from_datasets()` method: it loads a `PDEOperatorDataset`, wraps it in a `DataLoader`, and optionally performs a deterministic 80/20 train/val split when `--val-dataset` is omitted. Their train/test scaffolding is mirrored through shared `_train_from_dataset()` and `_test_from_dataset()` paths, with solver-specific behavior isolated to small hook methods.
 
 ```bash
 # Stage 1 — generate once, reuse many times
@@ -145,8 +144,8 @@ python src/trainer.py train --solver fno \
     --val-dataset   pretrained_models/val_data \
     --epochs 30
 
-# Stage 2b — train shared PINN on same dataset
-python src/trainer.py train --solver pinn \
+# Stage 2b — train fixed-resolution DeepONet on same dataset
+python src/trainer.py train --solver deeponet \
     --train-dataset pretrained_models/train_data \
     --epochs 20 --lam-data 1.0
 
@@ -168,30 +167,26 @@ python src/trainer.py fno --samples 5000 --epochs 30
 # fno-generate  →  generate
 # fno-train     →  train --solver fno
 # fno           →  generate + train --solver fno
-# pinn          →  train --solver pinn
 # fno-test      →  test --solver fno
-# pinn-test     →  test --solver pinn
-# Note: --steps-per-problem is accepted for backward compatibility in PINN training,
-# but trainer.py now uses one dataset pass per epoch for both FNO and PINN.
 ```
 
 ### 3. Inference routing
 
-`InferenceEngine.solve()` is the single entry point regardless of backend. FNO and PINN now follow the same routing skeleton: model-availability check → shared OOD gate (`_maybe_ood_fd_fallback`) → offline fast path (if available) or online training path.
+`InferenceEngine.solve()` is the single entry point regardless of backend. FNO and DeepONet follow the same routing skeleton: model-availability check → shared OOD gate → offline fast path (if available) or FD fallback.
 
 | Condition | Route |
 |---|---|
 | `solver_type="fno"`, weights exist, query in-distribution | Offline forward pass (`_fno_path`) |
 | `solver_type="fno"`, weights exist, OOD detected | Jacobi FD fallback; `result.is_ood=True` |
 | `solver_type="fno"`, weights missing | Online FNO training, optional warm-start |
-| `solver_type="pinn"`, weights/model loaded, query in-distribution | Offline forward pass (`_pinn_path`) |
-| `solver_type="pinn"`, weights/model loaded, OOD detected | Jacobi FD fallback; `result.is_ood=True` |
-| `solver_type="pinn"`, weights/model missing | Online PINN training |
+| `solver_type="deeponet"`, weights loaded, query in-distribution | Offline forward pass (`_deeponet_path`) |
+| `solver_type="deeponet"`, weights loaded, OOD detected | Jacobi FD fallback; `result.is_ood=True` |
+| `solver_type="deeponet"`, weights missing or resolution mismatch | Jacobi FD fallback |
 | `solver_type="fd"` | Jacobi FD always |
 
 ### 4. OOD detection
 
-`OODDetector` can gate both FNO and PINN queries when a manifest is configured. At training time, `PDEFeaturizer.featurize()` converts each `(ParsedPDE, bc_specs)` pair to a 25-dimensional vector encoding PDE coefficients, RHS statistics, and per-wall BC parameters. `OODDetector.build_manifest()` stores the normalised training features and the 95th-percentile leave-one-out KNN distance as the threshold.
+`OODDetector` can gate both FNO and DeepONet queries when a manifest is configured. At training time, `PDEFeaturizer.featurize()` converts each `(ParsedPDE, bc_specs)` pair to a 25-dimensional vector encoding PDE coefficients, RHS statistics, and per-wall BC parameters. `OODDetector.build_manifest()` stores the normalised training features and the 95th-percentile leave-one-out KNN distance as the threshold.
 
 At inference time, three checks run in order:
 1. **Structural**: time-dependent or hyperbolic PDE → OOD immediately
@@ -200,7 +195,7 @@ At inference time, three checks run in order:
 
 ### 5. Unified input encoding
 
-All three solver paths (FNO offline, FNO online, shared PINN) consume the same 7-channel tensor produced by `ConditionalGrid2D`:
+All three solver paths (FNO offline, FNO online, fixed-resolution DeepONet) consume the same 7-channel tensor produced by `ConditionalGrid2D`:
 
 ```
 channel 0 : x coordinate
@@ -224,10 +219,10 @@ Note: channel 4 is not a numerically estimated normal-flux field. In the current
 | Format | When written | How loaded |
 |---|---|---|
 | Plain state-dict `{layer: tensor}` | `torch.save(model.state_dict(), ...)` | Direct `load_state_dict` |
-| Metadata envelope `{"arch": "shared_pinn", "state_dict": {...}}` | `PINNTrainer` saves | Unwrapped before `load_state_dict` |
+| Metadata envelope `{"arch": "deeponet", "n_points": 32, "state_dict": {...}}` | `DeepONetTrainer` saves | Unwrapped before `load_state_dict` |
 | TorchScript archive (ZIP) | `ConditionalFNO2D.export_torchscript()` | `torch.jit.load`; `skip_if_torchscript=True` available for warm-start bypass |
 
-`read_checkpoint_arch()` inspects the `arch` key without loading weights, allowing routing decisions (e.g. `ConditionalPINN2D` vs `ConditionalPINN2D`) without a full model instantiation.
+`read_checkpoint_arch()` inspects the `arch` key without loading weights, allowing routing decisions without a full model instantiation.
 
 ---
 
@@ -252,10 +247,10 @@ python src/evaluate.py fno \
     --dataset pretrained_models/val_data \
     --model   pretrained_models/fno.pt
 
-# Evaluate a trained shared PINN
-python src/evaluate.py pinn \
+# Evaluate a trained DeepONet
+python src/evaluate.py deeponet \
     --dataset pretrained_models/val_data \
-    --model   pretrained_models/pinn.pt
+    --model   pretrained_models/deeponet.pt
 
 # Sanity check: FD against itself (should give ~zero error)
 python src/evaluate.py fd \
@@ -283,12 +278,12 @@ Python 3.10–3.12. Install with `pip install -e .` from the repo root.
 ## Roadmap
 
 ### Performance (partially done)
-- [ ] **PINN epoch callback → `st.progress()`** — Add `on_epoch` callback to `_pinn_online_path` and `ConditionalPINN2D.fit()`; wire to a Streamlit progress bar in `app.py`. Removes the silent spinner during 30–300 s online training.
+- [ ] **DeepONet inference feedback** — Surface fixed-resolution DeepONet artifact status and FD fallback reasons directly in the UI.
 - [ ] **Pre-evaluate BC arrays before Jacobi loop** — `GeneralPDE.apply_boundary_conditions` calls sympy lambdas 5000 × 4 walls per solve. Pre-compute all four boundary value tensors once outside the loop and pass them in. ~30 lines across `pde_helpers.py` and `inference_engine.py`.
 - [x] **Structured `logging`** — All progress output in `trainer.py` now uses `logging.getLogger(__name__)` (INFO/WARNING level) in place of `print()`. Formatted summary tables (`_print_test_summary`, `_print_smoke_summary`) remain as `print()` for human-readable terminal output.
 
 ### Scale
-- [x] **`DataLoader`-based training** — Both `FNOTrainer` and `PINNTrainer` now stream data through `PDEOperatorDataset` + `DataLoader(batch_size=1)` via `_DatasetTrainerBase._build_loaders_from_datasets()`. They now share mirrored `_train_from_dataset()` and `_test_from_dataset()` control flow (cosine scheduler + epoch validation in both). `batch_size > 1` remains blocked by the physics-loss batching requirement in `pde_helpers.py`.
+- [x] **`DataLoader`-based training** — Both `FNOTrainer` and `DeepONetTrainer` stream data through `PDEOperatorDataset` + `DataLoader` via `_DatasetTrainerBase._build_loaders_from_datasets()`. They share mirrored `_train_from_dataset()` and `_test_from_dataset()` control flow (cosine scheduler + epoch validation in both).
 - [ ] **Pre-parse PDE/BC coefficients at generation time** — `_load_examples()` calls sympy `parse_pde()` per sample; at 50 ms × 50k samples = 40+ min before the first training step. Store the 6 parsed float coefficients (`a, b, c, d, e, f`) directly in the `.npz` at generation time in `_solve_one_worker()`, then reconstruct `ParsedPDE` from floats in `_load_examples()`.
 - [ ] **HPC scheduler/worker** — Generation is already parallelisable with the current `ProcessPoolExecutor` setup. Training uses `DataLoader` but still runs single-process; DDP + mid-run checkpointing are needed before it can be distributed across nodes.
 

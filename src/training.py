@@ -8,12 +8,43 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 
-def hybrid_loss(
+def _mean_physics_loss(
     u_pred: torch.Tensor,
-    target: torch.Tensor | None,
+    pde_obj: Any,
+) -> torch.Tensor:
+    if u_pred.ndim == 2:
+        return pde_obj.compute_pde_loss(u_pred)
+    if len(pde_obj) != u_pred.shape[0]:
+        raise ValueError("pde_obj batch length must match prediction batch size")
+    losses = [obj.compute_pde_loss(u_pred[idx]) for idx, obj in enumerate(pde_obj)]
+    return torch.stack(losses).mean()
+
+
+def _mean_bc_loss(
+    u_pred: torch.Tensor,
     pde_obj: Any,
     x_1d: torch.Tensor,
     y_1d: torch.Tensor,
+) -> torch.Tensor:
+    if u_pred.ndim == 2:
+        return pde_obj.compute_bc_loss(u_pred, x_1d, y_1d)
+    if len(pde_obj) != u_pred.shape[0]:
+        raise ValueError("pde_obj batch length must match prediction batch size")
+    if x_1d.ndim != 2 or y_1d.ndim != 2:
+        raise ValueError("Batched x_1d and y_1d tensors must have shape (batch, n_points)")
+    losses = [
+        obj.compute_bc_loss(u_pred[idx], x_1d[idx], y_1d[idx])
+        for idx, obj in enumerate(pde_obj)
+    ]
+    return torch.stack(losses).mean()
+
+
+def hybrid_loss(
+    u_pred: torch.Tensor,
+    target: torch.Tensor | None,
+    pde_obj: Any | None,
+    x_1d: torch.Tensor | None,
+    y_1d: torch.Tensor | None,
     lam_data: float = 1.0,
     lam_phys: float = 1.0,
     lam_bc: float = 1.0,
@@ -24,8 +55,14 @@ def hybrid_loss(
         if target is None:
             raise ValueError("target is required when with_data=True")
         loss = loss + lam_data * torch.mean((u_pred - target) ** 2)
-    loss = loss + lam_phys * pde_obj.compute_pde_loss(u_pred)
-    loss = loss + lam_bc * pde_obj.compute_bc_loss(u_pred, x_1d, y_1d)
+    if lam_phys != 0.0:
+        if pde_obj is None:
+            raise ValueError("pde_obj is required when lam_phys != 0")
+        loss = loss + lam_phys * _mean_physics_loss(u_pred, pde_obj)
+    if lam_bc != 0.0:
+        if pde_obj is None or x_1d is None or y_1d is None:
+            raise ValueError("pde_obj, x_1d, y_1d are required when lam_bc != 0")
+        loss = loss + lam_bc * _mean_bc_loss(u_pred, pde_obj, x_1d, y_1d)
     return loss
 
 
@@ -39,14 +76,14 @@ def evaluate_operator(
     n = 0
     with torch.no_grad():
         for batch in loader:
-            pred = model(batch["input"]).squeeze(0).squeeze(-1)
-            target = batch["target"].squeeze(0) if batch["target"] is not None else None
+            pred = model(batch["input"]).squeeze(-1)
+            target = batch["target"]
             loss = hybrid_loss(
                 u_pred=pred,
                 target=target,
-                pde_obj=batch["pde_obj"],
-                x_1d=batch["x_1d"],
-                y_1d=batch["y_1d"],
+                pde_obj=batch.get("pde_obj"),
+                x_1d=batch.get("x_1d"),
+                y_1d=batch.get("y_1d"),
                 with_data=batch["has_target"],
                 **loss_cfg,
             )
@@ -122,14 +159,14 @@ def train_operator(
         model.train()
         for batch in train_loader:
             optimizer.zero_grad()
-            pred = model(batch["input"]).squeeze(0).squeeze(-1)
-            target = batch["target"].squeeze(0) if batch["target"] is not None else None
+            pred = model(batch["input"]).squeeze(-1)
+            target = batch["target"]
             loss = hybrid_loss(
                 u_pred=pred,
                 target=target,
-                pde_obj=batch["pde_obj"],
-                x_1d=batch["x_1d"],
-                y_1d=batch["y_1d"],
+                pde_obj=batch.get("pde_obj"),
+                x_1d=batch.get("x_1d"),
+                y_1d=batch.get("y_1d"),
                 with_data=batch["has_target"],
                 **loss_cfg,
             )
