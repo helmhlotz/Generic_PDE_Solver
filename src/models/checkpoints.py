@@ -90,3 +90,25 @@ def read_checkpoint_arch(path: str, device: torch.device) -> "str | None":
     except Exception:
         pass
     return None
+
+
+def read_checkpoint_n_points(path: str, device: torch.device) -> "int | None":
+    """Return the fixed training resolution stored in checkpoint metadata, or ``None``."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    if _zipfile.is_zipfile(p):
+        with _zipfile.ZipFile(p, "r") as _z:
+            names = _z.namelist()
+            if any("constants.pkl" in n or n.startswith("code/") for n in names):
+                return None
+    try:
+        ckpt = torch.load(path, map_location=device, weights_only=True)
+        if isinstance(ckpt, dict) and "n_points" in ckpt:
+            raw = ckpt["n_points"]
+            if isinstance(raw, torch.Tensor):
+                return int(raw.item())
+            return int(raw)
+    except Exception:
+        pass
+    return None

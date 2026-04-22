@@ -1,4 +1,4 @@
-"""Conditional neural PDE solvers and shared PINN utilities."""
+"""Conditional neural PDE solvers and operator-model utilities."""
 
 from __future__ import annotations
 
@@ -181,7 +181,97 @@ class _PointwiseConditionalPINNNet(nn.Module):
         return out.reshape(batch, nx, ny, 1)
 
 
-class SharedConditionalPINN2D(NeuralPDEModel):
+class DeepONet2DModel(nn.Module):
+    """Fixed-resolution DeepONet consuming the shared 7-channel conditional grid."""
+
+    def __init__(
+        self,
+        n_points: int,
+        in_channels: int = 7,
+        branch_hidden: int = 128,
+        branch_layers: int = 3,
+        trunk_hidden: int = 128,
+        trunk_layers: int = 3,
+        latent_dim: int = 128,
+    ) -> None:
+        super().__init__()
+        if n_points < 4:
+            raise ValueError(f"DeepONet2DModel requires n_points >= 4; got {n_points}.")
+        if in_channels < 1:
+            raise ValueError(f"DeepONet2DModel requires in_channels >= 1; got {in_channels}.")
+        if branch_layers < 1 or trunk_layers < 1:
+            raise ValueError("DeepONet2DModel branch_layers and trunk_layers must be >= 1.")
+        if branch_hidden < 1 or trunk_hidden < 1 or latent_dim < 1:
+            raise ValueError("DeepONet2DModel widths and latent_dim must be >= 1.")
+
+        self.n_points = int(n_points)
+        self.in_channels = int(in_channels)
+        self.latent_dim = int(latent_dim)
+        self.register_buffer("coord_grid", self._make_coord_grid(self.n_points), persistent=False)
+
+        self.branch_net = self._make_mlp(
+            in_dim=self.n_points * self.n_points * self.in_channels,
+            hidden_dim=branch_hidden,
+            n_layers=branch_layers,
+            out_dim=self.latent_dim,
+        )
+        self.trunk_net = self._make_mlp(
+            in_dim=2,
+            hidden_dim=trunk_hidden,
+            n_layers=trunk_layers,
+            out_dim=self.latent_dim,
+        )
+        self.output_bias = nn.Parameter(torch.zeros(1))
+
+    @staticmethod
+    def _make_mlp(
+        *,
+        in_dim: int,
+        hidden_dim: int,
+        n_layers: int,
+        out_dim: int,
+    ) -> nn.Sequential:
+        layers: list[nn.Module] = []
+        current_dim = in_dim
+        for _ in range(n_layers):
+            layers.extend([nn.Linear(current_dim, hidden_dim), nn.Tanh()])
+            current_dim = hidden_dim
+        layers.append(nn.Linear(current_dim, out_dim))
+        return nn.Sequential(*layers)
+
+    @staticmethod
+    def _make_coord_grid(n_points: int) -> torch.Tensor:
+        x_1d = torch.linspace(0.0, 1.0, n_points)
+        y_1d = torch.linspace(0.0, 1.0, n_points)
+        xx, yy = torch.meshgrid(x_1d, y_1d, indexing="ij")
+        return torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
+
+    def forward(self, input_grid: torch.Tensor) -> torch.Tensor:
+        if input_grid.ndim != 4:
+            raise ValueError(
+                f"DeepONet2DModel expects input_grid rank 4 (batch, n, n, c); got {input_grid.shape}."
+            )
+        batch, nx, ny, channels = input_grid.shape
+        if channels != self.in_channels:
+            raise ValueError(
+                f"DeepONet2DModel expects {self.in_channels} channels; got {channels}."
+            )
+        if nx != self.n_points or ny != self.n_points:
+            raise ValueError(
+                "DeepONet2DModel resolution mismatch: "
+                f"expected {self.n_points}x{self.n_points}, got {nx}x{ny}."
+            )
+
+        branch_input = input_grid.reshape(batch, nx * ny * channels)
+        branch_latent = self.branch_net(branch_input)
+        trunk_input = self.coord_grid.to(device=input_grid.device, dtype=input_grid.dtype)
+        trunk_latent = self.trunk_net(trunk_input)
+
+        out = torch.einsum("bp,mp->bm", branch_latent, trunk_latent) + self.output_bias
+        return out.reshape(batch, self.n_points, self.n_points, 1)
+
+
+class ConditionalPINNOperator2D(NeuralPDEModel):
     """Shared-weights conditional PINN trained across many PDE problems."""
 
     def __init__(
@@ -335,8 +425,8 @@ class SharedConditionalPINN2D(NeuralPDEModel):
         }
 
 
-class ConditionalPINN2D(NeuralPDEModel):
-    """MLP PINN that solves arbitrary 2-D scalar PDEs."""
+class CollocationPINN2D(NeuralPDEModel):
+    """Collocation PINN that solves a single PDE problem by optimization."""
 
     def __init__(
         self,
@@ -633,10 +723,18 @@ class ConditionalPINN2D(NeuralPDEModel):
         print(f"Saved PINN weights -> {path}")
 
 
+# Backward-compatible public name: "ConditionalPINN2D" now refers only to the
+# shared operator-style PINN. The collocation solver remains available under an
+# explicit name so runtime code cannot confuse the two roles.
+ConditionalPINN2D = ConditionalPINNOperator2D
+
+
 __all__ = [
+    "CollocationPINN2D",
     "ConditionalFNO2D",
+    "DeepONet2DModel",
     "ConditionalPINN2D",
+    "ConditionalPINNOperator2D",
     "NeuralPDEModel",
-    "SharedConditionalPINN2D",
     "_PointwiseConditionalPINNNet",
 ]

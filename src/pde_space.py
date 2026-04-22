@@ -34,55 +34,55 @@ class PDESpaceConfig:
     * helm_f ≤ 0 keeps the zero-order term non-positive, preserving coercivity.
     * |d|, |e| are kept small relative to min(a, b) so that the mesh Péclet
       number  Pe = |d|·h / (2a)  stays < 1 on a 64×64 grid (h ~ 0.016),
-      i.e. |d| < 2a/h ~ 64·a.  The default range (−0.5, 0.5) is very
+      i.e. |d| < 2a/h ~ 64·a.  The thermal-v2 range (−0.2, 0.2) is
       conservative and can be widened after validation.
     * |c| must satisfy  c² < 4ab  for ellipticity of the cross-derivative term
-      u_xy.  With a,b ≥ 0.5 the bound is 4·0.5·0.5 = 1.0, so c_range is kept
-      within (−0.8, 0.8) by default.  c_prob = 0.0 disables it until validated.
+      u_xy.  With a,b ≥ 0.6 the bound is 4·0.6·0.6 = 1.44, so c_range is kept
+      within (−0.6, 0.6).  c_prob = 0.0 disables it until validated.
     """
 
     # ------------------------------------------------------------------ #
     # Second-order diffusion coefficients (must be > 0)                   #
     # ------------------------------------------------------------------ #
-    a_range: tuple[float, float] = (0.5, 2.0)   # u_xx
-    b_range: tuple[float, float] = (0.5, 2.0)   # u_yy
+    a_range: tuple[float, float] = (0.6, 2.0)   # u_xx
+    b_range: tuple[float, float] = (0.6, 2.0)   # u_yy
 
     # ------------------------------------------------------------------ #
     # First-order advection / drift coefficients                          #
     # Conservative initial range; widen after confirming solver stability  #
     # ------------------------------------------------------------------ #
-    d_range: tuple[float, float] = (-0.5, 0.5)  # u_x — cross-flow drift
-    d_prob:  float = 0.25                         # probability of including d*u_x
+    d_range: tuple[float, float] = (-0.2, 0.2)  # u_x — cross-flow drift
+    d_prob:  float = 0.15                         # probability of including d*u_x
 
-    e_range: tuple[float, float] = (-0.5, 0.5)  # u_y — axial drift
-    e_prob:  float = 0.25                         # probability of including e*u_y
+    e_range: tuple[float, float] = (-0.2, 0.2)  # u_y — axial drift
+    e_prob:  float = 0.15                         # probability of including e*u_y
 
     # ------------------------------------------------------------------ #
     # Optional cross-derivative u_xy (disabled by default until validated)#
     # Keep |c| < sqrt(4ab) ~ 1.0 for ellipticity                         #
     # ------------------------------------------------------------------ #
-    c_range: tuple[float, float] = (-0.8, 0.8)
+    c_range: tuple[float, float] = (-0.6, 0.6)
     c_prob:  float = 0.00                         # set > 0 to enable
 
     # ------------------------------------------------------------------ #
     # Helmholtz / reaction term: f*u, kept ≤ 0 to preserve ellipticity   #
     # ------------------------------------------------------------------ #
-    helm_f_range: tuple[float, float] = (-1.0, 0.0)
-    helm_f_prob: float = 0.20
+    helm_f_range: tuple[float, float] = (-0.8, 0.0)
+    helm_f_prob: float = 0.15
 
     # ------------------------------------------------------------------ #
     # Amplitude ranges for source term and BC values                      #
     # BC amplitude is non-negative because BCGenerator currently applies   #
     # abs(amplitude_scale) for robustness with Robin sampling.            #
     # ------------------------------------------------------------------ #
-    src_amplitude_range: tuple[float, float] = (-3.0, 3.0)
-    bc_amplitude_range: tuple[float, float] = (0.0, 2.0)
+    src_amplitude_range: tuple[float, float] = (-2.5, 2.5)
+    bc_amplitude_range: tuple[float, float] = (0.0, 1.5)
 
     # ------------------------------------------------------------------ #
     # BC type probabilities                                               #
     # ------------------------------------------------------------------ #
-    neumann_prob: float = 0.15
-    robin_prob: float = 0.10
+    neumann_prob: float = 0.20
+    robin_prob: float = 0.15
 
     # ------------------------------------------------------------------ #
     # Spatial wavenumbers used in BC and source expressions               #
@@ -92,36 +92,7 @@ class PDESpaceConfig:
     # ------------------------------------------------------------------ #
     # Thermal-domain source templates                                     #
     # ------------------------------------------------------------------ #
-    thermal_source_prob: float = 0.40  # fraction of samples using a thermal template
-
-    @classmethod
-    def thermal_v2(cls) -> "PDESpaceConfig":
-        """Return a thermal-focused v2 preset with conservative FD-safe defaults.
-
-        This profile is intended for steady thermal demos and early buoyancy-like
-        scalar advection-diffusion experiments where we want:
-        - stronger thermal-source coverage
-        - non-zero first-order transport terms, but with stable magnitudes
-        - no mixed-derivative term until explicitly validated
-        """
-        return cls(
-            a_range=(0.6, 2.0),
-            b_range=(0.6, 2.0),
-            d_range=(-0.2, 0.2),
-            d_prob=0.15,
-            e_range=(-0.2, 0.2),
-            e_prob=0.15,
-            c_range=(-0.6, 0.6),
-            c_prob=0.0,
-            helm_f_range=(-0.8, 0.0),
-            helm_f_prob=0.15,
-            src_amplitude_range=(-2.5, 2.5),
-            bc_amplitude_range=(0.0, 1.5),
-            neumann_prob=0.20,
-            robin_prob=0.15,
-            k_values=[1, 2, 3],
-            thermal_source_prob=0.70,
-        )
+    thermal_source_prob: float = 0.70  # fraction of samples using a thermal template
 
 
 # ---------------------------------------------------------------------------

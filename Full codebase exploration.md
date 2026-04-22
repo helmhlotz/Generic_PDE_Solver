@@ -114,7 +114,7 @@ SharedFDDataGenerator.generate()
     PDEFeaturizer  (25-dim OOD feature)
     → .npz dataset  +  manifest.npz
     ↓
-HybridFNOTrainer.train()           (or PINNTrainer for PINN)
+FNOTrainer.train()           (or PINNTrainer for PINN)
     hybrid loss = λ_data·MSE(pred, fd_target)
                 + λ_phys·PDE_residual
                 + λ_bc·BC_error
@@ -344,13 +344,13 @@ Both online paths skip OOD checking and return `SolveResult` with a populated `h
 | Command | What it does |
 |---|---|
 | `fno-generate` | LHS sample → FD solve 64×64 → save `.npz` + `manifest.npz` |
-| `fno-train` | Load `.npz` → `HybridFNOTrainer` → `fno.pt` + `fno_best.pt` |
+| `fno-train` | Load `.npz` → `FNOTrainer` → `fno.pt` + `fno_best.pt` |
 | `fno` | `fno-generate` + `fno-train` in one shot |
 | `pinn` | LHS sample → `PINNTrainer` → `pinn.pt` + `pinn_best.pt` |
 | `fno-test` | `evaluate.py` pipeline on test `.npz` |
 | `pinn-test` | Same for PINN |
 
-`HybridFNOTrainer` loss per step:
+`FNOTrainer` loss per step:
 
 $$\mathcal{L} = \lambda_\text{data} \cdot \|u_\text{pred} - u_\text{FD}\|^2 + \lambda_\text{phys} \cdot \text{PDE\_residual} + \lambda_\text{BC} \cdot \text{BC\_error}$$
 
