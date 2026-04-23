@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -71,21 +72,42 @@ def _extract_schema_version(data: np.lib.npyio.NpzFile) -> int:
     return 0
 
 
-def load_dataset_artifact(path: str) -> DatasetArtifact:
-    """Load and validate a dataset artifact, normalizing legacy field names."""
-    artifact_path = Path(path)
-    if not artifact_path.exists():
-        raise FileNotFoundError(f"Dataset artifact not found: {path}")
+def read_bc_json_field(
+    data: np.lib.npyio.NpzFile,
+    *,
+    artifact_path: str,
+    schema_version: int | None = None,
+) -> np.ndarray:
+    """Return the canonical BC JSON field, warning on legacy artifacts."""
+    if "bc_json" in data:
+        return data["bc_json"]
+    if "bc_dict_json" in data:
+        schema_msg = (
+            f" schema_version={schema_version},"
+            if schema_version is not None
+            else ""
+        )
+        warnings.warn(
+            (
+                f"Artifact {artifact_path!r} uses deprecated field 'bc_dict_json'."
+                f"{schema_msg} regenerate this dataset to store 'bc_json' instead."
+            ),
+            UserWarning,
+            stacklevel=2,
+        )
+        return data["bc_dict_json"]
+    raise DatasetArtifactError("Dataset artifact is missing required field 'bc_json'.")
 
-    data = np.load(str(artifact_path), allow_pickle=True)
-    inputs = _require_field(data, "inputs")
-    targets = _require_field(data, "targets")
-    feats = _require_field(data, "feats")
-    pde_strs = _require_field(data, "pde_strs")
-    bc_json = data["bc_json"] if "bc_json" in data else _require_field(data, "bc_dict_json")
-    schema_version = _extract_schema_version(data)
-    n_points = _extract_n_points(data, inputs)
 
+def _validate_operator_array_fields(
+    *,
+    inputs: np.ndarray,
+    targets: np.ndarray,
+    feats: np.ndarray,
+    pde_strs: np.ndarray,
+    bc_json: np.ndarray,
+    n_points: int,
+) -> None:
     if inputs.ndim != 4:
         raise DatasetArtifactError(f"'inputs' must have shape (N, n, n, C); got {inputs.shape}.")
     if targets.ndim != 3:
@@ -114,7 +136,6 @@ def load_dataset_artifact(path: str) -> DatasetArtifact:
             f"inputs={inputs.shape[1]} / targets={targets.shape[1]}."
         )
 
-    normalized_pde_strs = np.asarray([str(item) for item in pde_strs], dtype=object)
     normalized_bc_json = np.asarray([str(item) for item in bc_json], dtype=object)
     for idx, raw in enumerate(normalized_bc_json):
         try:
@@ -123,6 +144,60 @@ def load_dataset_artifact(path: str) -> DatasetArtifact:
             raise DatasetArtifactError(
                 f"Dataset field 'bc_json' contains invalid JSON at sample {idx}."
             ) from exc
+
+
+def validate_chunk_fields(
+    data: np.lib.npyio.NpzFile,
+    *,
+    chunk_path: str,
+    expected_n_points: int,
+) -> None:
+    """Validate a saved generation chunk before resuming from it."""
+    inputs = _require_field(data, "inputs")
+    targets = _require_field(data, "targets")
+    feats = _require_field(data, "feats")
+    pde_strs = _require_field(data, "pde_strs")
+    bc_json = read_bc_json_field(data, artifact_path=chunk_path, schema_version=None)
+    _validate_operator_array_fields(
+        inputs=inputs,
+        targets=targets,
+        feats=feats,
+        pde_strs=pde_strs,
+        bc_json=bc_json,
+        n_points=expected_n_points,
+    )
+
+
+def load_dataset_artifact(path: str) -> DatasetArtifact:
+    """Load and validate a dataset artifact, normalizing legacy field names."""
+    artifact_path = Path(path)
+    if not artifact_path.exists():
+        raise FileNotFoundError(f"Dataset artifact not found: {path}")
+
+    data = np.load(str(artifact_path), allow_pickle=True)
+    inputs = _require_field(data, "inputs")
+    targets = _require_field(data, "targets")
+    feats = _require_field(data, "feats")
+    pde_strs = _require_field(data, "pde_strs")
+    schema_version = _extract_schema_version(data)
+    bc_json = read_bc_json_field(
+        data,
+        artifact_path=str(artifact_path),
+        schema_version=schema_version,
+    )
+    n_points = _extract_n_points(data, inputs)
+    _validate_operator_array_fields(
+        inputs=inputs,
+        targets=targets,
+        feats=feats,
+        pde_strs=pde_strs,
+        bc_json=bc_json,
+        n_points=n_points,
+    )
+
+    normalized_pde_strs = np.asarray([str(item) for item in pde_strs], dtype=object)
+    normalized_bc_json = np.asarray([str(item) for item in bc_json], dtype=object)
+    num_samples = int(inputs.shape[0])
 
     return DatasetArtifact(
         schema_version=schema_version,
@@ -151,8 +226,7 @@ def materialize_operator_examples(
 
         sample_n_points = int(config.n_points or artifact.inputs[idx].shape[0])
         if config.rebuild_inputs or artifact.inputs[idx].shape[0] != sample_n_points:
-            source_fn = parsed.rhs_fn()
-            grid = ConditionalGrid2D(sample_n_points, bc_specs, source_fn, config.device)
+            grid = ConditionalGrid2D(sample_n_points, parsed, bc_specs, config.device)
             input_tensor = grid.input_grid.squeeze(0)
             x_1d = grid.x_1d
             y_1d = grid.y_1d
@@ -247,8 +321,7 @@ class PDEOperatorDataset(Dataset):
         for prob in problems:
             parsed = parse_pde(prob["pde_str"])
             bc_specs = parse_bc(prob["bc_dict"])
-            source_fn = parsed.rhs_fn()
-            grid = ConditionalGrid2D(n_points, bc_specs, source_fn, self.device)
+            grid = ConditionalGrid2D(n_points, parsed, bc_specs, self.device)
             pde_obj = GeneralPDE(parsed, bc_specs)
             self.examples.append(
                 {

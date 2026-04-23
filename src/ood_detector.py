@@ -253,12 +253,7 @@ class OODDetector:
             calibration_label = f"holdout={len(calibration_features)}"
         else:
             # Fall back to training leave-one-out distances when no holdout set is provided.
-            threshold_source = np.zeros(n, dtype=np.float32)
-            for i in range(n):
-                diffs = features_norm - features_norm[i : i + 1]
-                dists = np.sqrt((diffs ** 2).sum(axis=1))
-                dists[i] = np.inf
-                threshold_source[i] = float(dists.min())
+            threshold_source = cls._leave_one_out_nearest_distances(features_norm)
             calibration_label = "train_loo"
 
         threshold = float(np.percentile(threshold_source, ood_percentile))
@@ -277,6 +272,52 @@ class OODDetector:
             f"calibration={calibration_label})"
         )
 
+    @staticmethod
+    def _leave_one_out_nearest_distances(features_norm: np.ndarray) -> np.ndarray:
+        """Return each sample's nearest-neighbor distance, excluding itself.
+
+        Uses a full pairwise matrix for moderate dataset sizes and falls back to
+        batched distance blocks when the dense NxN matrix would be too large.
+        """
+        n = len(features_norm)
+        if n == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        max_dense_bytes = 256 * 1024 * 1024
+        dense_bytes = n * n * np.dtype(np.float32).itemsize
+        if dense_bytes <= max_dense_bytes:
+            squared_norms = np.sum(features_norm ** 2, axis=1, dtype=np.float32)
+            dist_sq = (
+                squared_norms[:, None]
+                + squared_norms[None, :]
+                - 2.0 * (features_norm @ features_norm.T)
+            )
+            np.maximum(dist_sq, 0.0, out=dist_sq)
+            np.sqrt(dist_sq, out=dist_sq)
+            dists = dist_sq
+            np.fill_diagonal(dists, np.inf)
+            return dists.min(axis=1).astype(np.float32, copy=False)
+
+        batch_rows = max(1, max_dense_bytes // (n * np.dtype(np.float32).itemsize))
+        threshold_source = np.empty(n, dtype=np.float32)
+        full_squared_norms = np.sum(features_norm ** 2, axis=1, dtype=np.float32)
+        for start in range(0, n, batch_rows):
+            end = min(start + batch_rows, n)
+            batch = features_norm[start:end]
+            batch_squared_norms = np.sum(batch ** 2, axis=1, dtype=np.float32)
+            dist_sq = (
+                batch_squared_norms[:, None]
+                + full_squared_norms[None, :]
+                - 2.0 * (batch @ features_norm.T)
+            )
+            np.maximum(dist_sq, 0.0, out=dist_sq)
+            np.sqrt(dist_sq, out=dist_sq)
+            dists = dist_sq
+            row_idx = np.arange(start, end)
+            dists[np.arange(end - start), row_idx] = np.inf
+            threshold_source[start:end] = dists.min(axis=1)
+        return threshold_source
+
     # ------------------------------------------------------------------
     @staticmethod
     def is_available(manifest_path: str | Path) -> bool:
@@ -289,4 +330,3 @@ class OODDetector:
             return True
         except Exception:
             return False
-

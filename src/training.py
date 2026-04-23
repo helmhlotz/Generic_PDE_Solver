@@ -74,22 +74,24 @@ def evaluate_operator(
     model.eval()
     total = 0.0
     n = 0
-    with torch.no_grad():
-        for batch in loader:
-            pred = model(batch["input"]).squeeze(-1)
-            target = batch["target"]
-            loss = hybrid_loss(
-                u_pred=pred,
-                target=target,
-                pde_obj=batch.get("pde_obj"),
-                x_1d=batch.get("x_1d"),
-                y_1d=batch.get("y_1d"),
-                with_data=batch["has_target"],
-                **loss_cfg,
-            )
-            total += loss.item()
-            n += 1
-    model.train()
+    try:
+        with torch.no_grad():
+            for batch in loader:
+                pred = model(batch["input"]).squeeze(-1)
+                target = batch["target"]
+                loss = hybrid_loss(
+                    u_pred=pred,
+                    target=target,
+                    pde_obj=batch.get("pde_obj"),
+                    x_1d=batch.get("x_1d"),
+                    y_1d=batch.get("y_1d"),
+                    with_data=batch["has_target"],
+                    **loss_cfg,
+                )
+                total += loss.item()
+                n += 1
+    finally:
+        model.train()
     return total / max(n, 1)
 
 
@@ -107,6 +109,16 @@ def train_operator(
     checkpoint_path: str | None = None,
     resume: str | None = None,
 ) -> dict[str, Any]:
+    """Train an operator model with optional periodic validation.
+
+    Parameters
+    ----------
+    eval_every : int
+        Validation frequency. The units depend on ``eval_mode``:
+        ``eval_mode="epoch"`` evaluates every N epochs, while
+        ``eval_mode="step"`` evaluates every N gradient steps.
+        Public trainer entrypoints use epoch mode.
+    """
     start_epoch = 1
     best_val = float("inf")
     step = 0
@@ -180,9 +192,11 @@ def train_operator(
             if step % print_every == 0:
                 print(f"[{epoch}/{epochs}] step={step:06d} loss={loss.item():.3e}")
             if eval_mode == "step":
+                # In step mode, eval_every is interpreted in gradient steps.
                 maybe_eval(step)
 
         if eval_mode == "epoch":
+            # Public trainer paths use epoch mode, so eval_every means epochs.
             maybe_eval(epoch)
 
     last_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}

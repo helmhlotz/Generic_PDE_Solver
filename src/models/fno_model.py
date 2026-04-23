@@ -1,5 +1,6 @@
 import torch.nn as nn
 
+from models.conditional_inputs import CONDITIONAL_INPUT_CHANNELS
 from models.fno_layers import DomainPadding, FNOBlock, GridEmbedding2D
 
 
@@ -13,7 +14,7 @@ class FNO2DModel(nn.Module):
 
     def __init__(
         self,
-        in_channels=7,
+        in_channels=CONDITIONAL_INPUT_CHANNELS,
         out_channels=1,
         width=32,
         n_modes=(12, 12),

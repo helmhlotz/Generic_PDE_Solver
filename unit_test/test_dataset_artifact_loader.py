@@ -18,7 +18,7 @@ from dataset import (
 def _artifact_kwargs(*, bc_key: str = "bc_json") -> dict:
     return {
         "schema_version": np.array([CANONICAL_DATASET_SCHEMA_VERSION], dtype=np.int32),
-        "inputs": np.zeros((2, 4, 4, 7), dtype=np.float32),
+        "inputs": np.zeros((2, 4, 4, 13), dtype=np.float32),
         "targets": np.ones((2, 4, 4), dtype=np.float32),
         "feats": np.zeros((2, 25), dtype=np.float32),
         "pde_strs": np.array(["u_xx + u_yy = 0", "u_xx + u_yy = 1"], dtype=object),
@@ -56,7 +56,7 @@ def test_load_dataset_artifact_accepts_canonical_schema(tmp_path):
     assert artifact.schema_version == CANONICAL_DATASET_SCHEMA_VERSION
     assert artifact.num_samples == 2
     assert artifact.n_points == 4
-    assert artifact.inputs.shape == (2, 4, 4, 7)
+    assert artifact.inputs.shape == (2, 4, 4, 13)
     assert artifact.targets.shape == (2, 4, 4)
     assert artifact.feats.shape == (2, 25)
 
@@ -67,11 +67,22 @@ def test_load_dataset_artifact_normalizes_legacy_bc_key(tmp_path):
     kwargs.pop("schema_version")
     np.savez_compressed(path, **kwargs)
 
-    artifact = load_dataset_artifact(str(path))
+    with pytest.warns(UserWarning, match="bc_dict_json"):
+        artifact = load_dataset_artifact(str(path))
 
     assert artifact.schema_version == 0
     assert artifact.bc_json.shape == (2,)
     assert all(isinstance(item, str) for item in artifact.bc_json.tolist())
+
+
+def test_load_dataset_artifact_requires_canonical_bc_field(tmp_path):
+    path = tmp_path / "missing_bc.npz"
+    kwargs = _artifact_kwargs()
+    kwargs.pop("bc_json")
+    np.savez_compressed(path, **kwargs)
+
+    with pytest.raises(DatasetArtifactError, match="bc_json"):
+        load_dataset_artifact(str(path))
 
 
 def test_load_dataset_artifact_requires_feats(tmp_path):
@@ -95,7 +106,7 @@ def test_materialize_operator_examples_from_canonical_artifact(tmp_path):
     )
 
     assert len(examples) == 2
-    assert examples[0]["input"].shape == (4, 4, 7)
+    assert examples[0]["input"].shape == (4, 4, 13)
     assert examples[0]["target"].shape == (4, 4)
     assert examples[0]["has_target"] is True
 
@@ -112,5 +123,5 @@ def test_load_operator_dataset_builds_training_dataset_from_artifact(tmp_path):
     assert isinstance(dataset, MaterializedOperatorDataset)
     assert len(dataset) == 2
     sample = dataset[0]
-    assert sample["input"].shape == (4, 4, 7)
+    assert sample["input"].shape == (4, 4, 13)
     assert sample["target"].shape == (4, 4)

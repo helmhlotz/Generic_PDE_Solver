@@ -137,6 +137,16 @@ def evaluate_dataset(
     fd_targets: np.ndarray = artifact.targets
     pde_strs: np.ndarray = artifact.pde_strs
     bc_json: np.ndarray = artifact.bc_json
+    dataset_n_points = int(artifact.n_points)
+    solver_n_points = int(solver_option.grid.n_points)
+
+    if solver_n_points != dataset_n_points:
+        raise ValueError(
+            "Evaluation resolution mismatch: "
+            f"solver grid is {solver_n_points}x{solver_n_points}, "
+            f"but dataset targets are {dataset_n_points}x{dataset_n_points}. "
+            f"Re-run with --n-points {dataset_n_points}."
+        )
 
     total = len(fd_targets)
     if n_samples is not None:
@@ -165,20 +175,15 @@ def evaluate_dataset(
             n_failed += 1
             continue
 
-        # Evaluation should compare like-for-like grids; a mismatch usually
-        # means the inference resolution does not match the dataset resolution.
         u_pred = result.u
         if u_pred.shape != u_fd.shape:
-            print(
-                f"  Sample {i}: skipped due to resolution mismatch "
-                f"(prediction {u_pred.shape} vs FD target {u_fd.shape})"
+            raise ValueError(
+                "Solver produced an unexpected output shape during evaluation: "
+                f"prediction {u_pred.shape} vs FD target {u_fd.shape}. "
+                f"Re-run with --n-points {dataset_n_points}."
             )
-            n_failed += 1
-            continue
-        else:
-            u_fd_cmp = u_fd
 
-        m = _compute_metrics(u_pred, u_fd_cmp, result)
+        m = _compute_metrics(u_pred, u_fd, result)
         metrics_list.append(m)
 
         if m.is_ood:

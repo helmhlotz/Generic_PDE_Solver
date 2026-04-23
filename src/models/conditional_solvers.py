@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from models.checkpoints import load_model_weights
-from models.conditional_inputs import ConditionalGrid2D
+from models.conditional_inputs import CONDITIONAL_INPUT_CHANNELS, ConditionalGrid2D
 from models.fno_model import FNO2DModel
 from pde_parser import ParsedBC, ParsedIC, ParsedPDE
 from physics.pde_helpers import GeneralPDE
@@ -70,10 +70,8 @@ class ConditionalFNO2D(NeuralPDEModel):
         )
 
         self.pde_obj = GeneralPDE(parsed_pde, bc_specs, ic_specs)
-        source_fn = parsed_pde.rhs_fn()
-
         self.model = FNO2DModel(
-            in_channels=7,
+            in_channels=CONDITIONAL_INPUT_CHANNELS,
             out_channels=1,
             width=width,
             n_modes=n_modes,
@@ -89,7 +87,13 @@ class ConditionalFNO2D(NeuralPDEModel):
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
-        grid = ConditionalGrid2D(n_points, bc_specs, source_fn, self.device, t_value=self.t_value)
+        grid = ConditionalGrid2D(
+            n_points,
+            parsed_pde,
+            bc_specs,
+            self.device,
+            t_value=self.t_value,
+        )
         self.input_grid = grid.input_grid
         self.x_1d = grid.x_1d
         self.y_1d = grid.y_1d
@@ -136,10 +140,13 @@ class ConditionalFNO2D(NeuralPDEModel):
 
     def evaluate(self, n_eval: int = 100, t: float | None = None) -> dict[str, Any]:
         self.model.eval()
-        source_fn = self.pde_obj.parsed_pde.rhs_fn()
         t_eval = self.t_value if t is None else float(t)
         grid = ConditionalGrid2D(
-            n_eval, self.pde_obj.bc_specs, source_fn, self.device, t_value=t_eval
+            n_eval,
+            self.pde_obj.parsed_pde,
+            self.pde_obj.bc_specs,
+            self.device,
+            t_value=t_eval,
         )
         with torch.no_grad():
             u = self._predict(grid.input_grid)
@@ -164,9 +171,9 @@ class ConditionalFNO2D(NeuralPDEModel):
 
 
 class _PointwiseConditionalPINNNet(nn.Module):
-    """Pointwise MLP that maps the 7-channel conditional encoding to u(x,y)."""
+    """Pointwise MLP that maps the shared conditional encoding to u(x,y)."""
 
-    def __init__(self, in_channels: int = 7, hidden: int = 64, n_layers: int = 4):
+    def __init__(self, in_channels: int = CONDITIONAL_INPUT_CHANNELS, hidden: int = 64, n_layers: int = 4):
         super().__init__()
         layers: list[nn.Module] = [nn.Linear(in_channels, hidden), nn.Tanh()]
         for _ in range(n_layers - 1):
@@ -182,12 +189,12 @@ class _PointwiseConditionalPINNNet(nn.Module):
 
 
 class DeepONet2DModel(nn.Module):
-    """Fixed-resolution DeepONet consuming the shared 7-channel conditional grid."""
+    """Fixed-resolution DeepONet consuming the shared conditional grid."""
 
     def __init__(
         self,
         n_points: int,
-        in_channels: int = 7,
+        in_channels: int = CONDITIONAL_INPUT_CHANNELS,
         branch_hidden: int = 128,
         branch_layers: int = 3,
         trunk_hidden: int = 128,
@@ -305,9 +312,8 @@ class ConditionalPINNOperator2D(NeuralPDEModel):
         )
 
         self.pde_obj = GeneralPDE(parsed_pde, bc_specs, ic_specs)
-        source_fn = parsed_pde.rhs_fn()
         self.model = _PointwiseConditionalPINNNet(
-            in_channels=7,
+            in_channels=CONDITIONAL_INPUT_CHANNELS,
             hidden=hidden,
             n_layers=n_layers,
         ).to(self.device)
@@ -318,7 +324,13 @@ class ConditionalPINNOperator2D(NeuralPDEModel):
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
-        grid = ConditionalGrid2D(n_points, bc_specs, source_fn, self.device, t_value=self.t_value)
+        grid = ConditionalGrid2D(
+            n_points,
+            parsed_pde,
+            bc_specs,
+            self.device,
+            t_value=self.t_value,
+        )
         self.input_grid = grid.input_grid
         self.x_1d = grid.x_1d
         self.y_1d = grid.y_1d
@@ -410,10 +422,13 @@ class ConditionalPINNOperator2D(NeuralPDEModel):
 
     def evaluate(self, n_eval: int = 100, t: float | None = None) -> dict[str, Any]:
         self.model.eval()
-        source_fn = self.pde_obj.parsed_pde.rhs_fn()
         t_eval = self.t_value if t is None else float(t)
         grid = ConditionalGrid2D(
-            n_eval, self.pde_obj.bc_specs, source_fn, self.device, t_value=t_eval
+            n_eval,
+            self.pde_obj.parsed_pde,
+            self.pde_obj.bc_specs,
+            self.device,
+            t_value=t_eval,
         )
         with torch.no_grad():
             u = self._predict(grid.input_grid)

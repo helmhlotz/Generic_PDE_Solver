@@ -1,10 +1,11 @@
 import json
 
 import numpy as np
+import pytest
 
 import evaluate
 from dataset import CANONICAL_DATASET_SCHEMA_VERSION
-from inference_engine import SolveResult, SolverOption
+from inference_engine import GridConfig, SolveResult, SolverOption
 
 
 def _write_dataset(path, *, bc_key: str) -> np.ndarray:
@@ -22,7 +23,7 @@ def _write_dataset(path, *, bc_key: str) -> np.ndarray:
     np.savez_compressed(
         path,
         schema_version=np.array([CANONICAL_DATASET_SCHEMA_VERSION], dtype=np.int32),
-        inputs=np.zeros((1, 4, 4, 7), dtype=np.float32),
+        inputs=np.zeros((1, 4, 4, 13), dtype=np.float32),
         targets=target,
         feats=np.zeros((1, 25), dtype=np.float32),
         pde_strs=np.array(["u_xx + u_yy = 0"], dtype=object),
@@ -68,7 +69,7 @@ def test_evaluate_dataset_e2e_accepts_current_bc_json_schema(tmp_path, monkeypat
 
     metrics, summary = evaluate.evaluate_dataset(
         str(dataset_path),
-        SolverOption(solver_type="deeponet"),
+        SolverOption(solver_type="deeponet", grid=GridConfig(n_points=4)),
         print_every=1,
     )
 
@@ -106,7 +107,7 @@ def test_evaluate_dataset_e2e_accepts_legacy_bc_dict_json_schema(tmp_path, monke
 
     metrics, summary = evaluate.evaluate_dataset(
         str(dataset_path),
-        SolverOption(solver_type="fd"),
+        SolverOption(solver_type="fd", grid=GridConfig(n_points=4)),
         print_every=1,
     )
 
@@ -114,3 +115,15 @@ def test_evaluate_dataset_e2e_accepts_legacy_bc_dict_json_schema(tmp_path, monke
     assert metrics[0].method == "fd"
     assert summary["n_samples"] == 1
     assert summary["n_failed"] == 0
+
+
+def test_evaluate_dataset_fails_early_on_resolution_mismatch(tmp_path):
+    dataset_path = tmp_path / "eval_data_current.npz"
+    _write_dataset(dataset_path, bc_key="bc_json")
+
+    with pytest.raises(ValueError, match="Re-run with --n-points 4"):
+        evaluate.evaluate_dataset(
+            str(dataset_path),
+            SolverOption(solver_type="fd"),
+            print_every=1,
+        )

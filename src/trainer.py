@@ -38,10 +38,12 @@ from dataset import (
     collate_supervised_batch,
     load_dataset_artifact,
     load_operator_dataset,
+    read_bc_json_field,
+    validate_chunk_fields,
     CANONICAL_DATASET_SCHEMA_VERSION,
     OperatorMaterializationConfig,
 )
-from models.conditional_inputs import ConditionalGrid2D
+from models.conditional_inputs import CONDITIONAL_INPUT_CHANNELS, ConditionalGrid2D
 from models.conditional_solvers import DeepONet2DModel
 from models.fno_model import FNO2DModel
 from pde_space import PDESpaceConfig, LHSSampler
@@ -107,9 +109,8 @@ def _solve_one_worker(args: tuple) -> dict | None:
     try:
         parsed_pde = parse_pde(prob["pde_str"])
         bc_specs = parse_bc(prob["bc_dict"])
-        source_fn = parsed_pde.rhs_fn()
         device = torch.device(device_str)
-        grid = ConditionalGrid2D(n_points, bc_specs, source_fn, device)
+        grid = ConditionalGrid2D(n_points, parsed_pde, bc_specs, device)
         pde_obj = GeneralPDE(parsed_pde, bc_specs)
         u_fd = _solve_fd_standalone(pde_obj, n_points, device, max_iters, tol)
         if u_fd is None:
@@ -151,7 +152,7 @@ class SharedFDDataGenerator:
         n_samples: int = 5000,
         seed: int = 42,
         save_path: str = "pretrained_models/train_data",
-        max_iterations: int = 5000,
+        max_iterations: int = 50000,
         tolerance: float = 1e-5,
         print_every: int = 200,
         n_workers: int | None = None,
@@ -170,7 +171,8 @@ class SharedFDDataGenerator:
         sampler = LHSSampler(config)
         problems = sampler.generate(n_samples=n_samples, seed=seed)
 
-        n_workers = n_workers or multiprocessing.cpu_count()
+        if n_workers is None:
+            n_workers = multiprocessing.cpu_count()
 
         inputs: list[np.ndarray] = []
         targets: list[np.ndarray] = []
@@ -187,10 +189,17 @@ class SharedFDDataGenerator:
             if Path(chunk_path).exists():
                 log.info("Loading existing chunk %d–%d …", chunk_start, chunk_end)
                 c = np.load(chunk_path, allow_pickle=True)
+                validate_chunk_fields(
+                    c,
+                    chunk_path=chunk_path,
+                    expected_n_points=self.n_points,
+                )
                 inputs.extend(c["inputs"])
                 targets.extend(c["targets"])
                 pde_strs.extend(c["pde_strs"].tolist())
-                bc_json.extend((c["bc_json"] if "bc_json" in c else c["bc_dict_json"]).tolist())
+                bc_json.extend(
+                    read_bc_json_field(c, artifact_path=chunk_path, schema_version=None).tolist()
+                )
                 feats.extend(c["feats"])
                 total_done += len(c["inputs"])
                 continue
@@ -202,12 +211,20 @@ class SharedFDDataGenerator:
             ]
 
             chunk_results: list[dict] = []
-            with ProcessPoolExecutor(max_workers=n_workers) as ex:
-                futures = {ex.submit(_solve_one_worker, a): i for i, a in enumerate(args_list)}
-                for fut in as_completed(futures):
-                    r = fut.result()
-                    if r is not None:
-                        chunk_results.append(r)
+            if n_workers <= 1:
+                # Keep generation single-process for deterministic debugging and
+                # restricted environments where process pools are unavailable.
+                for work_item in args_list:
+                    result = _solve_one_worker(work_item)
+                    if result is not None:
+                        chunk_results.append(result)
+            else:
+                with ProcessPoolExecutor(max_workers=n_workers) as ex:
+                    futures = {ex.submit(_solve_one_worker, a): i for i, a in enumerate(args_list)}
+                    for fut in as_completed(futures):
+                        r = fut.result()
+                        if r is not None:
+                            chunk_results.append(r)
 
             if chunk_results:
                 c_inputs = np.stack([r["input"] for r in chunk_results])
@@ -300,6 +317,16 @@ def _make_operator_loader(
     )
 
 
+def _derived_checkpoint_path(save_path: str) -> Path:
+    path = Path(save_path)
+    return path.with_suffix(".ckpt")
+
+
+def _derived_best_path(save_path: str) -> Path:
+    path = Path(save_path)
+    return path.with_name(f"{path.stem}_best{path.suffix}")
+
+
 def _run_and_save_operator_training(
     *,
     model: nn.Module,
@@ -328,7 +355,7 @@ def _run_and_save_operator_training(
         print_every=print_every,
         eval_every=eval_every,
         eval_mode=eval_mode,
-        checkpoint_path=str(save_path).replace(".pt", ".ckpt"),
+        checkpoint_path=str(_derived_checkpoint_path(save_path)),
     )
 
     wrap = state_wrap or (lambda state: state)
@@ -337,7 +364,7 @@ def _run_and_save_operator_training(
     log.info("Saved final %s → %s", label, save_path)
 
     if result["best_state"] is not None:
-        best_path = str(save_path).replace(".pt", "_best.pt")
+        best_path = _derived_best_path(save_path)
         torch.save(wrap(result["best_state"]), best_path)
         log.info("Saved best  %s → %s", label, best_path)
 
@@ -491,12 +518,15 @@ class _DatasetTrainerBase:
         eval_every: int,
         seed: int,
         train_log_label: str,
+        auto_val_fraction: float = 0.2,
         steps_per_problem: int = 1,
         use_targets: bool = True,
         rebuild_inputs: bool = False,
     ) -> None:
         torch.manual_seed(seed)
         np.random.seed(seed)
+        if not 0.0 <= auto_val_fraction <= 1.0:
+            raise ValueError("auto_val_fraction must be between 0.0 and 1.0")
 
         train_loader, val_loader, n_train, n_val, auto_split = self._build_loaders_from_datasets(
             train_dataset_path=train_dataset_path,
@@ -506,7 +536,7 @@ class _DatasetTrainerBase:
             rebuild_inputs=rebuild_inputs,
             shuffle_train=True,
             steps_per_problem=steps_per_problem,
-            auto_val_fraction=0.2,
+            auto_val_fraction=auto_val_fraction,
             seed=seed,
         )
 
@@ -570,29 +600,31 @@ class _DatasetTrainerBase:
 
         model = self._operator_module()
         model.eval()
-        with torch.no_grad():
-            for i, ex in enumerate(examples):
-                u_pred = model(ex["input"].unsqueeze(0)).squeeze(0).squeeze(-1)
-                u_fd = ex["target"]
+        try:
+            with torch.no_grad():
+                for i, ex in enumerate(examples):
+                    u_pred = model(ex["input"].unsqueeze(0)).squeeze(0).squeeze(-1)
+                    u_fd = ex["target"]
 
-                rel_l2, rmse, max_err = compute_sample_metrics(
-                    u_pred.cpu().numpy(), u_fd.cpu().numpy()
-                )
-                bc_err = float(ex["pde_obj"].compute_bc_loss(u_pred, ex["x_1d"], ex["y_1d"]))
-                pde_res = float(ex["pde_obj"].compute_pde_loss(u_pred))
-
-                rel_l2s.append(rel_l2)
-                max_errs.append(max_err)
-                rmses.append(rmse)
-                bc_errs.append(bc_err)
-                pde_ress.append(pde_res)
-
-                if (i + 1) % print_every == 0:
-                    log.info(
-                        "  [%5d/%d] rel_l2=%.3e  max=%.3e  rmse=%.3e",
-                        i + 1, len(examples), rel_l2, max_err, rmse,
+                    rel_l2, rmse, max_err = compute_sample_metrics(
+                        u_pred.cpu().numpy(), u_fd.cpu().numpy()
                     )
-        model.train()
+                    bc_err = float(ex["pde_obj"].compute_bc_loss(u_pred, ex["x_1d"], ex["y_1d"]))
+                    pde_res = float(ex["pde_obj"].compute_pde_loss(u_pred))
+
+                    rel_l2s.append(rel_l2)
+                    max_errs.append(max_err)
+                    rmses.append(rmse)
+                    bc_errs.append(bc_err)
+                    pde_ress.append(pde_res)
+
+                    if (i + 1) % print_every == 0:
+                        log.info(
+                            "  [%5d/%d] rel_l2=%.3e  max=%.3e  rmse=%.3e",
+                            i + 1, len(examples), rel_l2, max_err, rmse,
+                        )
+        finally:
+            model.train()
 
         arr = np.array(rel_l2s)
         summary = {
@@ -632,6 +664,11 @@ class FNOTrainer(_DatasetTrainerBase):
         self.lam_data  = lam_data
         self.lam_phys  = lam_phys
         self.lam_bc    = lam_bc
+        if self.lam_phys != 0.0 or self.lam_bc != 0.0:
+            raise ValueError(
+                "FNOTrainer uses collate_supervised_batch, which drops pde_obj, x_1d, "
+                "and y_1d. Set lam_phys=0 and lam_bc=0 for supervised FNO training."
+            )
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
         self.batch_size = batch_size
@@ -639,7 +676,7 @@ class FNOTrainer(_DatasetTrainerBase):
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
         )
         self.model = FNO2DModel(
-            in_channels=7,
+            in_channels=CONDITIONAL_INPUT_CHANNELS,
             out_channels=1,
             width=width,
             n_modes=n_modes,
@@ -679,6 +716,7 @@ class FNOTrainer(_DatasetTrainerBase):
         print_every: int = 200,
         eval_every: int = 1,
         seed: int = 42,
+        auto_val_fraction: float = 0.2,
     ) -> None:
         """Train FNO from generated dataset using supervised operator loss."""
         self._train_from_dataset(
@@ -690,6 +728,7 @@ class FNOTrainer(_DatasetTrainerBase):
             eval_every=eval_every,
             seed=seed,
             train_log_label="supervised FNO",
+            auto_val_fraction=auto_val_fraction,
         )
 
     # ------------------------------------------------------------------
@@ -749,7 +788,7 @@ class DeepONetTrainer(_DatasetTrainerBase):
         )
         self.model = DeepONet2DModel(
             n_points=self.n_points,
-            in_channels=7,
+            in_channels=CONDITIONAL_INPUT_CHANNELS,
             branch_hidden=self.branch_hidden,
             branch_layers=self.branch_layers,
             trunk_hidden=self.trunk_hidden,
@@ -791,6 +830,7 @@ class DeepONetTrainer(_DatasetTrainerBase):
         seed: int = 42,
         print_every: int = 500,
         eval_every: int = 1,
+        auto_val_fraction: float = 0.2,
     ) -> None:
         """Train DeepONet from generated datasets only."""
         self._train_from_dataset(
@@ -802,6 +842,7 @@ class DeepONetTrainer(_DatasetTrainerBase):
             eval_every=eval_every,
             seed=seed,
             train_log_label="DeepONet",
+            auto_val_fraction=auto_val_fraction,
         )
 
     def test(
@@ -990,7 +1031,8 @@ def _run_fno_training(args: argparse.Namespace) -> None:
         save_path=save_path,
         seed=args.seed,
         print_every=args.print_every if args.print_every is not None else 200,
-        eval_every=args.eval_every if args.eval_every is not None else 1,
+        eval_every=args.eval_every,
+        auto_val_fraction=args.auto_val_fraction,
     )
     log.info("FNO training complete.")
 
@@ -1017,7 +1059,8 @@ def _run_deeponet_training(args: argparse.Namespace) -> None:
         save_path=save_path,
         seed=args.seed,
         print_every=args.print_every if args.print_every is not None else 500,
-        eval_every=args.eval_every if args.eval_every is not None else 1,
+        eval_every=args.eval_every,
+        auto_val_fraction=args.auto_val_fraction,
     )
     log.info("DeepONet training complete.")
 
@@ -1082,12 +1125,6 @@ def _run_generate_command(args: argparse.Namespace) -> None:
         n_workers=args.n_workers,
         ood_percentile=args.ood_percentile,
     )
-    if getattr(args, "manifest_path", None):
-        log.warning(
-            "--manifest-path on generate/fno-generate is deprecated; "
-            "use the 'manifest' sub-command instead."
-        )
-
     val_dataset_path: str | None = None
     if args.n_val > 0:
         val_dataset_path = args.val_dataset_path
@@ -1101,6 +1138,30 @@ def _run_generate_command(args: argparse.Namespace) -> None:
             n_workers=args.n_workers,
             ood_percentile=args.ood_percentile,
         )
+
+    manifest_path = getattr(args, "manifest_path", None)
+    if manifest_path:
+        build_ood_manifest(
+            train_dataset=args.dataset_path,
+            out_path=manifest_path,
+            percentile=args.ood_percentile,
+            val_dataset=val_dataset_path,
+        )
+        return
+
+    suggested_manifest_path = str(Path(args.dataset_path).parent / "manifest.npz")
+    manifest_cmd = [
+        "python -m src.trainer manifest",
+        f"--train-dataset {args.dataset_path}",
+        f"--out {suggested_manifest_path}",
+        f"--percentile {args.ood_percentile}",
+    ]
+    if val_dataset_path is not None:
+        manifest_cmd.append(f"--val-dataset {val_dataset_path}")
+    log.warning(
+        "OOD manifest not built. Before deployment, run: %s",
+        " ".join(manifest_cmd),
+    )
 
 
 def _run_manifest_command(args: argparse.Namespace) -> None:
@@ -1150,13 +1211,6 @@ def _run_test_command(args: argparse.Namespace) -> None:
 def _run_fno_generate(args: argparse.Namespace) -> None:
     _alias_warning("fno-generate", "generate")
     _run_generate_command(args)
-    if args.manifest_path:
-        build_ood_manifest(
-            train_dataset=args.dataset_path,
-            out_path=args.manifest_path,
-            percentile=args.ood_percentile,
-            val_dataset=args.val_dataset_path if args.n_val > 0 else None,
-        )
 
 
 def _run_fno_train(args: argparse.Namespace) -> None:
@@ -1216,6 +1270,7 @@ def _run_fno_one_shot(args: argparse.Namespace) -> None:
         seed=args.seed,
         print_every=args.print_every,
         eval_every=args.eval_every,
+        auto_val_fraction=args.auto_val_fraction,
     )
 
 
@@ -1268,13 +1323,19 @@ def _make_parser() -> argparse.ArgumentParser:
     gen_sub.add_argument("--dataset-path", type=str, default="pretrained_models/train_data")
     gen_sub.add_argument("--n-val", type=int, default=64)
     gen_sub.add_argument("--val-dataset-path", type=str, default="pretrained_models/val_data")
-    gen_sub.add_argument("--max-iterations", type=int, default=5000)
+    gen_sub.add_argument("--max-iterations", type=int, default=50000)
     gen_sub.add_argument("--tolerance", type=float, default=1e-5)
     gen_sub.add_argument("--print-every", type=int, default=200)
     gen_sub.add_argument("--n-workers", type=int, default=None,
                          help="Worker processes for parallel FD generation (default: cpu_count)")
     gen_sub.add_argument("--ood-percentile", type=float, default=95.0,
                          help="KNN threshold percentile for OOD detection (default: 95.0)")
+    gen_sub.add_argument(
+        "--manifest-path",
+        type=str,
+        default=None,
+        help="If set, build an OOD manifest at this path after generation.",
+    )
     gen_sub.add_argument("--device", type=str, default=None)
 
     # --- unified train sub-command ---
@@ -1311,7 +1372,18 @@ def _make_parser() -> argparse.ArgumentParser:
     train_sub.add_argument("--checkpoint", type=str, default=None)
     train_sub.add_argument("--seed", type=int, default=42)
     train_sub.add_argument("--print-every", type=int, default=None)
-    train_sub.add_argument("--eval-every", type=int, default=None)
+    train_sub.add_argument(
+        "--auto-val-fraction",
+        type=float,
+        default=0.2,
+        help="When --val-dataset is omitted, split this fraction for validation (0 disables auto-split).",
+    )
+    train_sub.add_argument(
+        "--eval-every",
+        type=int,
+        default=1,
+        help="Evaluate validation set every N epochs (default: %(default)s)",
+    )
     train_sub.add_argument("--device", type=str, default=None)
 
     # --- unified test sub-command ---
@@ -1356,7 +1428,7 @@ def _make_parser() -> argparse.ArgumentParser:
     fno_gen_sub.add_argument("--n-val",         type=int,   default=64)
     fno_gen_sub.add_argument("--val-dataset-path", type=str, default="pretrained_models/val_data")
     fno_gen_sub.add_argument("--manifest-path", type=str,   default="pretrained_models/manifest.npz")
-    fno_gen_sub.add_argument("--max-iterations", type=int,  default=5000)
+    fno_gen_sub.add_argument("--max-iterations", type=int,  default=50000)
     fno_gen_sub.add_argument("--tolerance",      type=float, default=1e-5)
     fno_gen_sub.add_argument("--print-every",    type=int,   default=200)
     fno_gen_sub.add_argument("--n-workers",       type=int,   default=None,
@@ -1382,7 +1454,18 @@ def _make_parser() -> argparse.ArgumentParser:
     fno_train_sub.add_argument("--fno-path",      type=str,   default="pretrained_models/fno.pt")
     fno_train_sub.add_argument("--seed",          type=int,   default=42)
     fno_train_sub.add_argument("--print-every",   type=int,   default=200)
-    fno_train_sub.add_argument("--eval-every",    type=int,   default=1)
+    fno_train_sub.add_argument(
+        "--auto-val-fraction",
+        type=float,
+        default=0.2,
+        help="When --val-dataset is omitted, split this fraction for validation (0 disables auto-split).",
+    )
+    fno_train_sub.add_argument(
+        "--eval-every",
+        type=int,
+        default=1,
+        help="Evaluate validation set every N epochs (default: %(default)s)",
+    )
     fno_train_sub.add_argument("--device",        type=str,   default=None)
 
     # --- fno one-shot sub-command (backward-compatible) ---
@@ -1402,7 +1485,7 @@ def _make_parser() -> argparse.ArgumentParser:
     fno_sub.add_argument("--seed",          type=int,   default=42)
     fno_sub.add_argument("--dataset-path",  type=str,   default="pretrained_models/train_data")
     fno_sub.add_argument("--val-dataset-path", type=str, default="pretrained_models/val_data")
-    fno_sub.add_argument("--max-iterations", type=int, default=5000)
+    fno_sub.add_argument("--max-iterations", type=int, default=50000)
     fno_sub.add_argument("--tolerance", type=float, default=1e-5)
     fno_sub.add_argument("--fno-path",      type=str,   default="pretrained_models/fno.pt")
     fno_sub.add_argument("--manifest-path", type=str,   default="pretrained_models/manifest.npz")
@@ -1410,8 +1493,14 @@ def _make_parser() -> argparse.ArgumentParser:
     fno_sub.add_argument("--print-every",   type=int,   default=200)
     fno_sub.add_argument("--n-val",         type=int,   default=64,
                        help="Number of held-out validation problems (default: 64)")
+    fno_sub.add_argument(
+        "--auto-val-fraction",
+        type=float,
+        default=0.2,
+        help="When no held-out validation dataset is created, split this fraction for validation.",
+    )
     fno_sub.add_argument("--eval-every",    type=int,   default=1,
-                       help="Evaluate val set every N epochs (default: 1)")
+                       help="Evaluate validation set every N epochs (default: %(default)s)")
     fno_sub.add_argument("--n-workers",     type=int,   default=None,
                        help="Worker processes for parallel FD generation (default: cpu_count)")
     fno_sub.add_argument("--ood-percentile", type=float, default=95.0,

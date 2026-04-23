@@ -64,7 +64,7 @@ import torch.optim as optim
 sys.path.insert(0, str(Path(__file__).parent))
 
 from models.checkpoints import load_model_weights, read_checkpoint_arch, read_checkpoint_n_points
-from models.conditional_inputs import ConditionalGrid2D
+from models.conditional_inputs import CONDITIONAL_INPUT_CHANNELS, ConditionalGrid2D
 from models.conditional_solvers import (
     ConditionalFNO2D,
     DeepONet2DModel,
@@ -263,7 +263,7 @@ class _FNOSolver(_AbstractSolver):
         source_fn,
         n_points: int,
     ) -> SolveResult:
-        grid = ConditionalGrid2D(n_points, bc_specs, source_fn, self.device)
+        grid = ConditionalGrid2D(n_points, pde_obj.parsed_pde, bc_specs, self.device)
         self.model.eval()
         with torch.no_grad():
             u = self.model(grid.input_grid).squeeze(0).squeeze(-1)
@@ -399,7 +399,7 @@ class InferenceEngine:
 
         if self.options.solver_type == "fno":
             self._model = FNO2DModel(
-                in_channels=7,
+                in_channels=CONDITIONAL_INPUT_CHANNELS,
                 out_channels=1,
                 width=self.options.fno.width,
                 n_modes=self.options.fno.n_modes,
@@ -441,7 +441,7 @@ class InferenceEngine:
                         self._deeponet_n_points = self.options.grid.n_points
                     self._deeponet_model = DeepONet2DModel(
                         n_points=self._deeponet_n_points,
-                        in_channels=7,
+                        in_channels=CONDITIONAL_INPUT_CHANNELS,
                         branch_hidden=self.options.deeponet.branch_hidden,
                         branch_layers=self.options.deeponet.branch_layers,
                         trunk_hidden=self.options.deeponet.trunk_hidden,
@@ -721,8 +721,8 @@ class InferenceEngine:
         source_fn,
         n_points: int,
     ) -> SolveResult:
-        """Run a pre-traced TorchScript model using conditional 7-channel input."""
-        grid = ConditionalGrid2D(n_points, bc_specs, source_fn, self.device)
+        """Run a pre-traced TorchScript model using the shared conditional input."""
+        grid = ConditionalGrid2D(n_points, parsed_pde, bc_specs, self.device)
         try:
             with torch.no_grad():
                 out = self._jit_model(grid.input_grid)
@@ -798,9 +798,8 @@ class InferenceEngine:
         n_points: int,
         method: str,
     ) -> SolveResult:
-        """Run a preloaded operator model on the 7-channel conditional grid."""
-        source_fn = pde_obj.parsed_pde.rhs_fn()
-        grid = ConditionalGrid2D(n_points, pde_obj.bc_specs, source_fn, self.device)
+        """Run a preloaded operator model on the shared conditional grid."""
+        grid = ConditionalGrid2D(n_points, pde_obj.parsed_pde, pde_obj.bc_specs, self.device)
         model.eval()
         with torch.no_grad():
             u = model(grid.input_grid).squeeze(0).squeeze(-1)
